@@ -5,6 +5,7 @@ use tracing::info;
 use crate::config::PipelineConfig;
 use crate::error::Result;
 use crate::ingestion::{self, IngestionResult};
+use crate::tiling::lod;
 use crate::transform::{self, TransformResult};
 
 /// Summary of a completed pipeline run.
@@ -71,8 +72,42 @@ impl Pipeline {
         })
     }
 
-    fn tile(_config: &PipelineConfig, _transform: &TransformResult) -> Result<usize> {
-        todo!("Milestone 4: tiling stage")
+    fn tile(_config: &PipelineConfig, transform_result: &TransformResult) -> Result<usize> {
+        let max_lod_levels = 4;
+        let mut total_lod_levels = 0;
+
+        for (i, mesh) in transform_result.meshes.iter().enumerate() {
+            info!(
+                mesh = i,
+                vertices = mesh.vertex_count(),
+                triangles = mesh.triangle_count(),
+                "Generating LOD chain"
+            );
+
+            let chain =
+                lod::generate_lod_chain(mesh, &transform_result.bounds, max_lod_levels);
+
+            for level in &chain.levels {
+                info!(
+                    mesh = i,
+                    lod = level.level,
+                    triangles = level.mesh.triangle_count(),
+                    geometric_error = level.geometric_error,
+                    "LOD level"
+                );
+            }
+
+            total_lod_levels += chain.levels.len();
+        }
+
+        info!(
+            meshes = transform_result.meshes.len(),
+            total_lod_levels,
+            "LOD generation complete"
+        );
+
+        // TODO: Milestone 5+ -- spatial subdivision and GLB/tileset writing
+        todo!("Milestone 5: tile output writing")
     }
 
     fn validate(_config: &PipelineConfig) -> Result<()> {
