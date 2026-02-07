@@ -5,6 +5,7 @@ use tracing::info;
 use crate::config::PipelineConfig;
 use crate::error::Result;
 use crate::ingestion::{self, IngestionResult};
+use crate::transform::{self, TransformResult};
 
 /// Summary of a completed pipeline run.
 #[derive(Debug)]
@@ -35,9 +36,10 @@ impl Pipeline {
         }
 
         if config.dry_run {
-            info!("--dry-run: scanning input only");
-            let result = ingestion::ingest(config)?;
-            print_dry_run_summary(&result);
+            info!("--dry-run: scanning input and computing transforms");
+            let ingestion_result = ingestion::ingest(config)?;
+            let transform_result = transform::transform(config, &ingestion_result)?;
+            print_dry_run_summary(&ingestion_result, &transform_result);
             return Ok(ProcessingResult {
                 tile_count: 0,
                 duration: start.elapsed(),
@@ -49,10 +51,11 @@ impl Pipeline {
         let ingestion_result = ingestion::ingest(config)?;
 
         info!("Stage 2/4: Transform");
-        Self::transform(config, &ingestion_result)?;
+        let transform_result = transform::transform(config, &ingestion_result)?;
+        print_transform_summary(&transform_result);
 
         info!("Stage 3/4: Tiling");
-        let tile_count = Self::tile(config)?;
+        let tile_count = Self::tile(config, &transform_result)?;
 
         if config.validate {
             info!("Stage 4/4: Validation");
@@ -68,11 +71,7 @@ impl Pipeline {
         })
     }
 
-    fn transform(_config: &PipelineConfig, _ingestion: &IngestionResult) -> Result<()> {
-        todo!("Milestone 3: transform stage")
-    }
-
-    fn tile(_config: &PipelineConfig) -> Result<usize> {
+    fn tile(_config: &PipelineConfig, _transform: &TransformResult) -> Result<usize> {
         todo!("Milestone 4: tiling stage")
     }
 
@@ -99,9 +98,38 @@ fn print_georef(result: &IngestionResult) {
     }
 }
 
-/// Print dry-run summary with mesh stats and georeferencing.
-fn print_dry_run_summary(result: &IngestionResult) {
-    let stats = &result.stats;
+/// Print transform summary: bounding box and root transform.
+fn print_transform_summary(result: &TransformResult) {
+    let bb = &result.bounds;
+    println!("=== Transform ===");
+    println!(
+        "  Bounding box: ({:.3}, {:.3}, {:.3}) → ({:.3}, {:.3}, {:.3})",
+        bb.min[0], bb.min[1], bb.min[2], bb.max[0], bb.max[1], bb.max[2]
+    );
+    println!("  Diagonal:     {:.3} m", bb.diagonal());
+
+    let rt = &result.root_transform;
+    let is_identity = rt[0] == 1.0
+        && rt[5] == 1.0
+        && rt[10] == 1.0
+        && rt[15] == 1.0
+        && rt[12] == 0.0
+        && rt[13] == 0.0
+        && rt[14] == 0.0;
+
+    if is_identity {
+        println!("  Root transform: identity (local coordinates)");
+    } else {
+        println!(
+            "  Root transform: ECEF ({:.1}, {:.1}, {:.1})",
+            rt[12], rt[13], rt[14]
+        );
+    }
+}
+
+/// Print dry-run summary with mesh stats, georeferencing, and transform info.
+fn print_dry_run_summary(ingestion: &IngestionResult, transform: &TransformResult) {
+    let stats = &ingestion.stats;
     println!("=== Dry Run Summary ===");
     println!("  Format:    {}", stats.input_format);
     println!("  Meshes:    {}", stats.total_meshes);
@@ -113,5 +141,7 @@ fn print_dry_run_summary(result: &IngestionResult) {
     println!("  Materials: {}", stats.material_count);
     println!("  Textures:  {}", stats.texture_count);
     println!();
-    print_georef(result);
+    print_georef(ingestion);
+    println!();
+    print_transform_summary(transform);
 }
