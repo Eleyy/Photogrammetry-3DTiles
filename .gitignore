@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Temp files
+.temp/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test output
+coverage/
+*.lcov
+
+# Environment
+.env
+.env.local
+
+# Output tilesets (generated)
+tileset/
+output/
+test-output*/
