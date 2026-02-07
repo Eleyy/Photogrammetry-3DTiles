@@ -1,0 +1,89 @@
+[package]
+name = "photo-tiler"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Photogrammetry mesh to OGC 3D Tiles 1.1 converter"
+license = "MIT"
+authors = ["SGR"]
+keywords = ["3d-tiles", "photogrammetry", "cesium", "gltf", "geospatial"]
+categories = ["command-line-utilities", "graphics", "science::geo"]
+
+[[bin]]
+name = "photo-tiler"
+path = "src/main.rs"
+
+[lib]
+name = "photo_tiler"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Geometry processing
+meshopt = "0.6"
+gltf = { version = "1.4", features = ["extras", "extensions"] }
+gltf-json = "1.4"
+
+# Mesh I/O
+tobj = "4"
+ply-rs = "0.1"
+
+# Image processing
+image = { version = "0.25", features = ["jpeg", "png", "webp"] }
+
+# Math
+glam = { version = "0.31", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+# Parallelism
+rayon = "1.11"
+crossbeam = "0.8"
+
+# Coordinate transforms
+proj = "0.31"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# I/O
+memmap2 = "0.9"
+
+# HTTP service (optional)
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["full"], optional = true }
+tower = { version = "0.5", optional = true }
+
+[features]
+default = []
+server = ["axum", "tokio", "tower"]
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3"
+approx = "0.5"
+
+[[bench]]
+name = "simplify"
+harness = false
+
+[[bench]]
+name = "split"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

@@ -1,16 +1,6 @@
-# Dependencies
-node_modules/
-
-# Build output
-dist/
-
-# Temp files
-.temp/
-*.log
-
-# OS files
-.DS_Store
-Thumbs.db
+# Rust build
+target/
+Cargo.lock
 
 # IDE
 .vscode/
@@ -18,15 +8,24 @@ Thumbs.db
 *.swp
 *.swo
 
-# Test output
-coverage/
-*.lcov
+# OS
+.DS_Store
+Thumbs.db
 
 # Environment
 .env
 .env.local
 
+# Test data (large photogrammetry models)
+test/
+
 # Output tilesets (generated)
 tileset/
 output/
 test-output*/
+
+# Viewer (separate project)
+viewer/
+
+# Logs
+*.log
