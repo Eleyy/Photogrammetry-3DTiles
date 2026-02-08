@@ -1,11 +1,12 @@
 use std::time::{Duration, Instant};
 
+use rayon::prelude::*;
 use tracing::info;
 
 use crate::config::PipelineConfig;
 use crate::error::Result;
 use crate::ingestion::{self, IngestionResult};
-use crate::tiling::lod;
+use crate::tiling::{lod, tileset_writer};
 use crate::transform::{self, TransformResult};
 
 /// Summary of a completed pipeline run.
@@ -72,46 +73,68 @@ impl Pipeline {
         })
     }
 
-    fn tile(_config: &PipelineConfig, transform_result: &TransformResult) -> Result<usize> {
+    fn tile(config: &PipelineConfig, transform_result: &TransformResult) -> Result<usize> {
         let max_lod_levels = 4;
-        let mut total_lod_levels = 0;
 
-        for (i, mesh) in transform_result.meshes.iter().enumerate() {
-            info!(
-                mesh = i,
-                vertices = mesh.vertex_count(),
-                triangles = mesh.triangle_count(),
-                "Generating LOD chain"
-            );
-
-            let chain =
-                lod::generate_lod_chain(mesh, &transform_result.bounds, max_lod_levels);
-
-            for level in &chain.levels {
+        let lod_chains: Vec<_> = transform_result
+            .meshes
+            .par_iter()
+            .enumerate()
+            .map(|(i, mesh)| {
                 info!(
                     mesh = i,
-                    lod = level.level,
-                    triangles = level.mesh.triangle_count(),
-                    geometric_error = level.geometric_error,
-                    "LOD level"
+                    vertices = mesh.vertex_count(),
+                    triangles = mesh.triangle_count(),
+                    "Generating LOD chain"
                 );
-            }
 
-            total_lod_levels += chain.levels.len();
-        }
+                let chain =
+                    lod::generate_lod_chain(mesh, &transform_result.bounds, max_lod_levels);
 
+                for level in &chain.levels {
+                    info!(
+                        mesh = i,
+                        lod = level.level,
+                        triangles = level.mesh.triangle_count(),
+                        geometric_error = level.geometric_error,
+                        "LOD level"
+                    );
+                }
+
+                chain
+            })
+            .collect();
+
+        let total_lod_levels: usize = lod_chains.iter().map(|c| c.levels.len()).sum();
         info!(
             meshes = transform_result.meshes.len(),
             total_lod_levels,
             "LOD generation complete"
         );
 
-        // TODO: Milestone 5+ -- spatial subdivision and GLB/tileset writing
-        todo!("Milestone 5: tile output writing")
+        // Build tile hierarchy
+        info!("Building tile hierarchy");
+        let tileset_output = tileset_writer::build_tileset(
+            &lod_chains,
+            &transform_result.bounds,
+            &config.tiling,
+            &transform_result.materials,
+            &config.texture,
+        );
+
+        // Write tileset to output directory
+        info!(output = %config.output.display(), "Writing tileset");
+        let tile_count = tileset_writer::write_tileset(
+            &tileset_output,
+            &transform_result.root_transform,
+            &config.output,
+        )?;
+
+        Ok(tile_count)
     }
 
     fn validate(_config: &PipelineConfig) -> Result<()> {
-        todo!("Milestone 5: validation stage")
+        todo!("Milestone 6: validation stage")
     }
 }
 
