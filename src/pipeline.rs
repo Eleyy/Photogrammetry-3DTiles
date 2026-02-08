@@ -1,10 +1,12 @@
+use std::fs;
 use std::time::{Duration, Instant};
 
+use gltf::binary::Glb;
 use rayon::prelude::*;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::PipelineConfig;
-use crate::error::Result;
+use crate::error::{PhotoTilerError, Result};
 use crate::ingestion::{self, IngestionResult};
 use crate::tiling::{lod, tileset_writer};
 use crate::transform::{self, TransformResult};
@@ -57,6 +59,12 @@ impl Pipeline {
         print_transform_summary(&transform_result);
 
         info!("Stage 3/4: Tiling");
+        fs::create_dir_all(&config.output).map_err(|e| {
+            PhotoTilerError::Output(format!(
+                "Failed to create output directory {}: {e}",
+                config.output.display()
+            ))
+        })?;
         let tile_count = Self::tile(config, &transform_result)?;
 
         if config.validate {
@@ -133,8 +141,126 @@ impl Pipeline {
         Ok(tile_count)
     }
 
-    fn validate(_config: &PipelineConfig) -> Result<()> {
-        todo!("Milestone 6: validation stage")
+    fn validate(config: &PipelineConfig) -> Result<()> {
+        let out_dir = &config.output;
+
+        // 1. tileset.json must exist and be valid JSON
+        let tileset_path = out_dir.join("tileset.json");
+        let json_str = fs::read_to_string(&tileset_path).map_err(|e| {
+            PhotoTilerError::Validation(format!(
+                "Cannot read tileset.json at {}: {e}",
+                tileset_path.display()
+            ))
+        })?;
+
+        let tileset: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
+            PhotoTilerError::Validation(format!("tileset.json is not valid JSON: {e}"))
+        })?;
+
+        // 2. Required top-level fields
+        let asset = tileset
+            .get("asset")
+            .ok_or_else(|| PhotoTilerError::Validation("Missing 'asset' field".into()))?;
+        let version = asset
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if version != "1.1" {
+            return Err(PhotoTilerError::Validation(format!(
+                "Expected asset.version '1.1', got '{version}'"
+            )));
+        }
+
+        let root = tileset
+            .get("root")
+            .ok_or_else(|| PhotoTilerError::Validation("Missing 'root' tile".into()))?;
+
+        // 3. Walk tile tree: validate each tile
+        let mut tile_count = 0;
+        let mut glb_count = 0;
+        let mut errors = Vec::new();
+        validate_tile(root, out_dir, None, &mut tile_count, &mut glb_count, &mut errors);
+
+        for err in &errors {
+            warn!("Validation: {err}");
+        }
+
+        if errors.is_empty() {
+            info!(tiles = tile_count, glbs = glb_count, "Validation passed");
+        } else {
+            return Err(PhotoTilerError::Validation(format!(
+                "{} issues found: {}",
+                errors.len(),
+                errors.first().unwrap()
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// Recursively validate a tile node from tileset.json.
+fn validate_tile(
+    tile: &serde_json::Value,
+    out_dir: &std::path::Path,
+    parent_error: Option<f64>,
+    tile_count: &mut usize,
+    glb_count: &mut usize,
+    errors: &mut Vec<String>,
+) {
+    *tile_count += 1;
+
+    // Bounding volume must exist
+    if tile.get("boundingVolume").is_none() {
+        errors.push(format!("Tile {tile_count}: missing boundingVolume"));
+    }
+
+    // Geometric error must be non-negative
+    let geo_error = tile
+        .get("geometricError")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(-1.0);
+    if geo_error < 0.0 {
+        errors.push(format!("Tile {tile_count}: invalid geometricError {geo_error}"));
+    }
+
+    // Geometric error should not exceed parent's
+    if let Some(parent_err) = parent_error {
+        if geo_error > parent_err + 1e-6 {
+            errors.push(format!(
+                "Tile {tile_count}: geometricError {geo_error} > parent {parent_err}"
+            ));
+        }
+    }
+
+    // If tile has content, verify the GLB file
+    if let Some(content) = tile.get("content") {
+        if let Some(uri) = content.get("uri").and_then(|u| u.as_str()) {
+            let glb_path = out_dir.join(uri);
+            if !glb_path.exists() {
+                errors.push(format!("Tile {tile_count}: GLB not found: {uri}"));
+            } else {
+                *glb_count += 1;
+                // Try to parse the GLB
+                match fs::read(&glb_path) {
+                    Ok(data) => {
+                        if Glb::from_slice(&data).is_err() {
+                            errors.push(format!("Tile {tile_count}: GLB not parseable: {uri}"));
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("Tile {tile_count}: cannot read {uri}: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into children
+    if let Some(children) = tile.get("children").and_then(|c| c.as_array()) {
+        for child in children {
+            validate_tile(child, out_dir, Some(geo_error), tile_count, glb_count, errors);
+        }
     }
 }
 
