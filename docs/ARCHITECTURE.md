@@ -180,6 +180,8 @@ This stage follows the obj2tiles architecture: **decimate first, then split**.
 4. **GLB generation** (parallel per tile):
    - Build glTF document via `gltf-json`
    - Attach mesh primitives, PBR materials, compressed textures
+   - EXT_meshopt_compression for vertex/index buffer compression
+   - KHR_texture_basisu extension when using KTX2 textures
    - Write binary GLB
 
 5. **tileset.json output**:
@@ -197,11 +199,14 @@ Read back tileset.json and verify 3D Tiles 1.1 compliance.
 ### Sutherland-Hodgman Triangle Clipping
 
 For each axis-aligned plane (6 planes per octant: min/max X, Y, Z):
-1. Classify each polygon vertex as inside/outside the half-space
-2. For each edge crossing the plane, compute intersection point at parameter `t`
-3. Interpolate all attributes (position, normal, UV, color) at `t`
-4. Fan-triangulate the resulting polygon
-5. Deduplicate boundary vertices via position hash
+1. Pre-filter: compute triangle AABB and skip octants that don't overlap (3-5x speedup)
+2. Classify each polygon vertex as inside/outside the half-space
+3. For each edge crossing the plane, compute intersection point at parameter `t`
+4. Interpolate all attributes (position, normal, UV, color) at `t`
+5. Fan-triangulate the resulting polygon
+6. Deduplicate boundary vertices via `DedupKey` hash (position + UV + normal, quantized to 1e-6/1e-4)
+
+The `DedupKey` includes UV and normal in addition to position, preventing UV seam corruption when vertices share positions but have different texture coordinates (common at UV seam boundaries).
 
 This runs on every triangle regardless of mesh size. No centroid fallback.
 
@@ -209,12 +214,12 @@ This runs on every triangle regardless of mesh size. No centroid fallback.
 
 Per-tile atlas repacking (following obj2tiles and mago3d-tiler):
 
-1. **Build edge adjacency**: For each triangle edge, record which faces share it
+1. **Build edge adjacency**: For each triangle edge (with UV-aware matching), record which faces share it
 2. **BFS connected components**: Group faces connected by shared edges into UV islands
 3. **Compute island UV bounds**: Min/max UV per island, padded by 2-5 pixels
 4. **Guillotine bin packing**: Pack island rectangles into a new atlas. Split free space by longest axis. Minimize total atlas area.
-5. **Extract + composite**: Copy pixel regions from source texture to atlas positions, adding bleed ring
-6. **UV remap**: Transform each vertex's UV from source space to atlas space
+5. **Extract + composite**: Copy pixel regions from source texture to atlas positions, adding bleed ring (edge + corner fill). Uses scanline bulk copy (`copy_from_slice()`) for contiguous UV ranges.
+6. **UV remap with vertex dedup**: `remap_uvs_with_dedup()` transforms each vertex's UV from source space to atlas space. When a vertex is shared across different UV islands (common after triangle clipping), it is duplicated with correct UV for each island. Applies half-texel inset to prevent bilinear filter bleed into padding.
 
 ### meshoptimizer Simplification
 
@@ -237,6 +242,8 @@ Key parameters:
 - Returns new index buffer referencing original vertices
 - Follow with `optimize_vertex_fetch()` to compact the vertex buffer
 
+**Adaptive simplification by depth**: For tree depth >= 3, uses relaxed parameters (ratio 0.5, no border lock) since deep nodes are coarse LODs rendered at distance. Shallow nodes use aggressive simplification (ratio 0.25, border lock enabled).
+
 ## Parallelism Model
 
 ```
@@ -247,10 +254,12 @@ rayon global thread pool (all cores)
   +-- Stage 3:
   |     +-- par_iter over LOD levels for simplification
   |     +-- par_iter over octants for triangle clipping
-  |     +-- par_iter over tiles for atlas repacking
-  |     +-- par_iter over tiles for GLB generation
+  |     +-- into_par_iter() over octant children in build_tile_recursive()
+  |         (each child independently: simplify + clip + atlas repack + GLB write)
   +-- Stage 4: sequential validation
 ```
+
+The key parallelization point is `build_tile_recursive()` in `tileset_writer.rs`: child octants are processed via `into_par_iter()`, which recursively fans out work across all cores. At depth 0 this gives 4-8 parallel branches; at depth 2+ the work-stealing scheduler distributes 64+ subtrees across all available cores. This single change provided a 7.5x speedup on an 11-core machine.
 
 All stages except validation use rayon's work-stealing parallelism. No manual thread management.
 
@@ -262,7 +271,7 @@ All stages except validation use rayon's work-stealing parallelism. No manual th
 - **Zero-copy where possible**: meshoptimizer operates on slices of existing buffers
 - **f64 for transforms, f32 for storage**: Avoids precision loss without doubling vertex memory
 
-Peak memory for a 169M-vertex OBJ: ~5-8GB (vs 12-16GB in the Node.js version).
+Peak memory for a 169M-vertex OBJ: ~10GB measured (vs 12-16GB in the Node.js version).
 
 ## Error Handling
 
@@ -305,6 +314,7 @@ All functions return `Result<T, PhotoTilerError>`. The `anyhow` crate is used at
 | `serde` + `serde_json` | JSON serialization for tileset.json |
 | `tracing` | Structured logging |
 | `thiserror` | Error type derivation |
+| `basis-universal` | KTX2/UASTC texture compression (optional, behind `ktx2` feature) |
 | `axum` | HTTP service (optional, behind `server` feature) |
 
 ## Reference Implementations

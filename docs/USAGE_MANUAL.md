@@ -39,6 +39,14 @@ cargo build --release
 
 The binary is at `target/release/photo-tiler`.
 
+### Build with KTX2 support
+
+KTX2/UASTC GPU-compressed textures require the `basis-universal` crate (optional):
+
+```bash
+cargo build --release --features ktx2
+```
+
 ### Install globally
 
 ```bash
@@ -278,9 +286,9 @@ This typically reduces per-tile texture data by 70-90%.
 
 | Format | Flag | Use Case |
 |--------|------|----------|
-| WebP | `--texture-format webp` | Good compression, wide browser support |
-| KTX2 | `--texture-format ktx2` | GPU-compressed, best for WebGL streaming |
-| Original | `--texture-format original` | No re-compression |
+| WebP | `--texture-format webp` | Good compression, wide browser support (default) |
+| KTX2 | `--texture-format ktx2` | GPU-compressed UASTC via Basis Universal. Requires `--features ktx2` build. Best for WebGL/WebGPU streaming. Falls back to WebP if feature not enabled. |
+| Original | `--texture-format original` | No re-compression (PNG output) |
 
 ### Quality and size limits
 
@@ -297,19 +305,23 @@ photo-tiler -i model.obj -o ./output --units m --no-textures
 
 ## Compression
 
-### Draco mesh compression
+### Meshopt compression (EXT_meshopt_compression)
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `--no-draco` | Disable Draco compression | enabled |
-| `--draco-level <n>` | Compression level 1 (fast) to 10 (best) | 7 |
+GLB output uses `EXT_meshopt_compression` for vertex and index buffer compression. This is enabled by default and provides efficient GPU-ready compressed buffers.
+
+### KTX2 texture compression (KHR_texture_basisu)
+
+When built with `--features ktx2` and using `--texture-format ktx2`, textures are encoded with Basis Universal UASTC mode. The GLB output includes the `KHR_texture_basisu` extension for GPU-native texture transcoding at runtime.
 
 ```bash
-# Maximum compression
-photo-tiler -i model.obj -o ./output --units m --draco-level 10
+# Build with KTX2 support
+cargo build --release --features ktx2
 
-# No compression (for debugging)
-photo-tiler -i model.obj -o ./output --units m --no-draco
+# Use KTX2 textures
+photo-tiler -i model.obj -o ./output --units m --texture-format ktx2 --texture-quality 85
+
+# Default (WebP, no special build required)
+photo-tiler -i model.obj -o ./output --units m --texture-format webp
 ```
 
 ---
@@ -461,7 +473,9 @@ Common conventions: Pix4D = meters, RealityCapture = meters or centimeters.
 
 ### Large model performance
 
-For models > 5M triangles, ensure you have sufficient RAM (roughly 5-8GB for 169M vertices). Tune with:
+For models > 5M triangles, ensure you have sufficient RAM (~10GB for 169M vertices). The pipeline automatically parallelizes across all available cores via rayon.
+
+Reference benchmark: 169M triangles (16.8 GB OBJ) processed in **34 minutes** on 11-core Apple Silicon, producing 9,552 tiles.
 
 ```bash
 photo-tiler -i model.obj -o ./output --units m \

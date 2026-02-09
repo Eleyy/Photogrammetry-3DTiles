@@ -1,124 +1,131 @@
 # Photo-Tiler Roadmap
 
-## Milestone 1: Foundation (Core Types + CLI Skeleton)
+## Milestone 1: Foundation (Core Types + CLI Skeleton) -- COMPLETE
 
 **Goal**: Project compiles, CLI parses args, core types defined.
 
-- [ ] Rust project scaffolding (`src/main.rs`, `src/lib.rs`, module structure)
-- [ ] `config.rs` -- `PipelineConfig`, `TilingConfig`, `TextureConfig` structs with clap derive
-- [ ] `error.rs` -- `PhotoTilerError` enum with thiserror
-- [ ] `types/mesh.rs` -- `IndexedMesh` struct with position/normal/UV/color/index buffers
-- [ ] `types/material.rs` -- `PBRMaterial`, `MaterialLibrary`, `TextureData`
-- [ ] `types/tile.rs` -- `TileNode`, `BoundingBox`
-- [ ] `main.rs` -- clap CLI matching all flags from the README
-- [ ] `pipeline.rs` -- pipeline skeleton that calls stage stubs
-- [ ] Unit tests for config parsing and type construction
+- [x] Rust project scaffolding (`src/main.rs`, `src/lib.rs`, module structure)
+- [x] `config.rs` -- `PipelineConfig`, `TilingConfig`, `TextureConfig` structs with clap derive
+- [x] `error.rs` -- `PhotoTilerError` enum with thiserror
+- [x] `types/mesh.rs` -- `IndexedMesh` struct with position/normal/UV/color/index buffers
+- [x] `types/material.rs` -- `PBRMaterial`, `MaterialLibrary`, `TextureData`
+- [x] `types/tile.rs` -- `TileNode`, `BoundingBox`
+- [x] `main.rs` -- clap CLI matching all flags from the README
+- [x] `pipeline.rs` -- pipeline skeleton that calls stage stubs
+- [x] Unit tests for config parsing and type construction
 
-## Milestone 2: Ingestion (File Parsers)
+## Milestone 2: Ingestion (File Parsers) -- COMPLETE
 
 **Goal**: Load OBJ, glTF, and PLY files into `IndexedMesh`.
 
-- [ ] `ingestion/obj_parser.rs` -- memory-mapped two-pass OBJ parser
+- [x] `ingestion/obj_parser.rs` -- memory-mapped two-pass OBJ parser
   - Pass 1: scan for counts and material group byte offsets via `memmap2`
   - Pass 2: parse vertices/faces into pre-allocated `Vec<f32>`/`Vec<u32>`
   - Parallel vertex parsing via rayon `par_chunks` on mmap'd regions
   - MTL parsing and texture loading
   - Handle fan-triangulation of quads/n-gons
-- [ ] `ingestion/gltf_loader.rs` -- load via `gltf` crate, extract meshes + PBR materials
-- [ ] `ingestion/ply_loader.rs` -- ASCII and binary (LE/BE) PLY parsing
-- [ ] `ingestion/georef.rs` -- auto-detect `offset.xyz`, `metadata.xml`, `.prj`
-- [ ] Integration tests with test data (`test/Model.obj`, `test/Model.mtl`, `test/Model.jpg`)
+- [x] `ingestion/gltf_loader.rs` -- load via `gltf` crate, extract meshes + PBR materials
+- [x] `ingestion/ply_loader.rs` -- ASCII and binary (LE/BE) PLY parsing
+- [x] `ingestion/georef.rs` -- auto-detect `offset.xyz`, `metadata.xml`, `.prj`
+- [x] Integration tests with test data (`test/Model.obj`, `test/Model.mtl`, `test/Model.jpg`)
 - [ ] Benchmark: OBJ parse throughput (MB/s) vs Node.js baseline
 
-## Milestone 3: Coordinate Transforms
+## Milestone 3: Coordinate Transforms -- COMPLETE
 
 **Goal**: Transform from source CRS to origin-centered with ECEF root matrix.
 
-- [ ] `transform/coordinates.rs` -- unit scaling (mm/cm/m/ft/in), Y-up to Z-up, centering
-- [ ] `transform/ecef.rs` -- geodetic to ECEF, ENU rotation matrix
-- [ ] `transform/projection.rs` -- CRS projection via `proj` crate (EPSG to WGS84)
-- [ ] All transforms in f64, final vertex cast to f32
-- [ ] Root transform 4x4 matrix assembly (pre-translation + ENU rotation + ECEF translation)
-- [ ] Unit tests against known UTM-to-ECEF conversions
+- [x] `transform/coordinates.rs` -- unit scaling (mm/cm/m/ft/in), Y-up to Z-up, centering
+- [x] `transform/ecef.rs` -- geodetic to ECEF, ENU rotation matrix
+- [x] `transform/projection.rs` -- CRS projection via `proj` crate (EPSG to WGS84)
+- [x] All transforms in f64, final vertex cast to f32
+- [x] Root transform 4x4 matrix assembly (pre-translation + ENU rotation + ECEF translation)
+- [x] Unit tests against known UTM-to-ECEF conversions
 
-## Milestone 4: Mesh Simplification (Decimate-First Pipeline)
+## Milestone 4: Mesh Simplification (Decimate-First Pipeline) -- COMPLETE
 
 **Goal**: Generate LOD meshes from full original mesh using native meshoptimizer.
 
-- [ ] `tiling/simplifier.rs` -- wrapper around `meshopt::simplify()`
+- [x] `tiling/simplifier.rs` -- wrapper around `meshopt::simplify()`
   - `simplify_mesh(mesh, target_ratio, lock_border) -> IndexedMesh`
   - Compact unused vertices after simplification
   - Preserve UV seam edges via `LockBorder` flag
-- [ ] LOD level generation: LOD 0 = original, LOD N = `0.5^N` ratio
-- [ ] Geometric error calculation: `diagonal * (1.0 - ratio) * 0.5`
+- [x] LOD level generation: LOD 0 = original, LOD N = `0.5^N` ratio
+- [x] Geometric error calculation: `diagonal * (1.0 - ratio) * 0.5`
+- [x] Relaxed simplification for deep levels (depth >= 3): ratio 0.5, no border lock
 - [ ] Benchmark: simplification speed (triangles/sec) vs WASM baseline
 
-## Milestone 5: Spatial Subdivision (Triangle Clipping)
+## Milestone 5: Spatial Subdivision (Triangle Clipping) -- COMPLETE
 
 **Goal**: Split each LOD mesh into octree tiles with correct geometry at boundaries.
 
-- [ ] `tiling/triangle_clipper.rs` -- Sutherland-Hodgman polygon clipping
+- [x] `tiling/triangle_clipper.rs` -- Sutherland-Hodgman polygon clipping
   - `clip_polygon_by_plane(vertices, plane) -> Vec<Vertex>`
   - Linear interpolation of all attributes at intersection points
   - Fan-triangulation of clipped polygons
   - No centroid fallback -- always clip
-- [ ] `tiling/octree.rs` -- adaptive octree subdivision
+- [x] `tiling/octree.rs` -- adaptive octree subdivision
   - Recursive 8-way bounding box split
   - Stop conditions: max depth, triangle count, min tile size
   - Per-octant triangle assignment via clipping
-  - Vertex deduplication at boundaries via position hash map
-- [ ] Parallel clipping: rayon `par_iter` over triangles per octant
-- [ ] Integration test: verify no gaps at tile boundaries (check boundary vertex sharing)
+  - Vertex deduplication at boundaries via `DedupKey` hash (position + UV + normal)
+- [x] AABB pre-filter: skip non-overlapping octants before clipping (3-5x speedup)
+- [x] Integration test: verify no gaps at tile boundaries (check boundary vertex sharing)
+- [x] Test: `split_mesh_preserves_uv_seams` -- verifies UV seam vertices survive splitting
 
-## Milestone 6: Texture Atlas Repacking
+## Milestone 6: Texture Atlas Repacking -- COMPLETE
 
 **Goal**: Per-tile UV island detection, bin packing, bleed padding, UV remapping.
 
-- [ ] `tiling/atlas_repacker.rs`
+- [x] `tiling/atlas_repacker.rs`
   - Edge adjacency map: for each edge, track which faces share it
-  - BFS connected-component island detection
+  - BFS connected-component island detection (UV-aware edge matching)
   - Per-island UV bounding rectangle computation
   - Guillotine bin packing algorithm (following mago3d-tiler)
-  - Bleed ring extraction (2-5 pixels per island size)
-  - UV coordinate remapping to atlas space
-  - Atlas image compositing via `image` crate
-- [ ] `tiling/texture_compress.rs` -- WebP/KTX2 compression
-- [ ] Handle UV coordinates outside [0,1] (wrapping textures)
-- [ ] OBJ UV V-flip correction (OBJ V=0 bottom, glTF V=0 top)
-- [ ] Integration test: verify UV mapping correctness after repacking
+  - Bleed ring extraction (2-5 pixels per island size) + corner bleed fill
+  - UV coordinate remapping with half-texel inset (prevents bilinear bleed)
+  - `remap_uvs_with_dedup()`: duplicates vertices shared across UV islands
+  - Atlas image compositing via `image` crate with scanline bulk copy optimization
+- [x] `tiling/texture_compress.rs` -- WebP/PNG encoding + KTX2/UASTC (optional `ktx2` feature)
+- [x] Handle UV coordinates outside [0,1] (wrapping textures)
+- [x] OBJ UV V-flip correction (OBJ V=0 bottom, glTF V=0 top)
+- [x] Integration test: verify UV mapping correctness after repacking
+- [x] Test: `repack_shared_vertex_across_islands` -- verifies shared vertices get correct UVs
 
-## Milestone 7: GLB Writer + tileset.json
+## Milestone 7: GLB Writer + tileset.json -- COMPLETE
 
 **Goal**: Write correct 3D Tiles 1.1 output.
 
-- [ ] `tiling/glb_writer.rs` -- build glTF document via `gltf-json`
+- [x] `tiling/glb_writer.rs` -- build glTF document via `gltf-json`
   - Create buffer, buffer views, accessors for mesh data
   - Create PBR materials with base color textures
   - Create mesh primitives with POSITION, NORMAL, TEXCOORD_0, indices
   - Assemble GLB binary (12-byte header + JSON chunk + binary chunk)
   - 4-byte alignment padding per chunk
-- [ ] `tiling/tileset_writer.rs` -- tileset.json generation
+  - EXT_meshopt_compression for vertex/index buffer compression
+  - KHR_texture_basisu extension when atlas texture is KTX2
+- [x] `tiling/tileset_writer.rs` -- tileset.json generation
   - 3D Tiles 1.1 spec compliance (guided by cesium-native)
   - Bounding volumes as oriented boxes (12-element array)
-  - Geometric error hierarchy
+  - Geometric error hierarchy (halves at each level)
   - REPLACE refinement
   - Root transform as 16-element column-major f64 array
   - Content URIs for each tile with geometry
-- [ ] Validation pass: read back tileset.json, verify structure
-- [ ] End-to-end test: convert test OBJ, load in viewer
+  - Parallel child processing via rayon `into_par_iter()`
+- [x] Validation pass: read back tileset.json, verify structure
+- [x] End-to-end test: convert test OBJ, load in viewer
 
-## Milestone 8: Full Pipeline Integration
+## Milestone 8: Full Pipeline Integration -- COMPLETE
 
 **Goal**: Complete end-to-end pipeline works for all input formats.
 
-- [ ] Wire all stages together in `pipeline.rs`
-- [ ] Progress reporting via `tracing`
-- [ ] Dry-run mode (scan + report without processing)
-- [ ] Show-georef mode
-- [ ] Parallel tile processing: rayon `par_iter` over tiles for repack + GLB
+- [x] Wire all stages together in `pipeline.rs`
+- [x] Progress reporting via `tracing`
+- [x] Dry-run mode (scan + report without processing)
+- [x] Show-georef mode
+- [x] Parallel tile processing: rayon `into_par_iter()` over octant children (7.5x speedup)
 - [ ] Error recovery: continue processing remaining tiles if one fails
-- [ ] Test with real photogrammetry datasets (Pix4D, Agisoft, RealityCapture)
-- [ ] Performance benchmark vs Node.js version on same dataset
+- [x] Test with real photogrammetry datasets (169M tri Pix4D model -- 34 min, 9,552 tiles)
+- [x] Performance benchmark: 34 min vs ~4.3 hours single-threaded (7.5x speedup)
 
 ## Milestone 9: HTTP Service
 
@@ -151,17 +158,17 @@
 - [ ] Published crate on crates.io
 - [ ] Complete API documentation (rustdoc)
 
-## Performance Targets
+## Performance Results
 
-| Metric | Node.js (old) | Rust (target) |
-|--------|--------------|---------------|
-| OBJ parse (16GB) | 10-18 min | <2 min |
-| Simplify 2M triangles | 2-6s (WASM) | <2s (native) |
-| Peak memory (169M verts) | 12-16 GB | 5-8 GB |
-| Total pipeline (169M tri) | ~70 min | <10 min |
-| CPU utilization | ~12% (1 core) | ~90% (all cores) |
-| Docker image | ~150 MB | <15 MB |
-| Cold start | ~100 ms | <10 ms |
+| Metric | Node.js (old) | Rust (target) | Rust (actual) |
+|--------|--------------|---------------|---------------|
+| OBJ parse (16GB) | 10-18 min | <2 min | ~2.5 min |
+| Simplify 2M triangles | 2-6s (WASM) | <2s (native) | ~10ms/100K tri |
+| Peak memory (169M verts) | 12-16 GB | 5-8 GB | ~10 GB |
+| Total pipeline (169M tri) | ~70 min | <10 min | **34 min** |
+| CPU utilization | ~12% (1 core) | ~90% (all cores) | **~65% (7+ cores)** |
+| Docker image | ~150 MB | <15 MB | TBD |
+| Cold start | ~100 ms | <10 ms | TBD |
 
 ## Architecture Decisions Log
 
