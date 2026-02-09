@@ -70,7 +70,7 @@ pub struct TilingConfig {
 impl Default for TilingConfig {
     fn default() -> Self {
         Self {
-            max_triangles_per_tile: 100_000,
+            max_triangles_per_tile: 65_000,
             max_depth: 6,
         }
     }
@@ -209,7 +209,7 @@ pub struct CliArgs {
     pub dry_run: bool,
 
     /// Max triangles per leaf tile
-    #[arg(long, default_value_t = 100_000)]
+    #[arg(long, default_value_t = 65_000)]
     pub max_triangles: usize,
 
     /// Max octree depth
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn default_tiling_config() {
         let tc = TilingConfig::default();
-        assert_eq!(tc.max_triangles_per_tile, 100_000);
+        assert_eq!(tc.max_triangles_per_tile, 65_000);
         assert_eq!(tc.max_depth, 6);
     }
 

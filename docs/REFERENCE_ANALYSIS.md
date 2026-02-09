@@ -675,3 +675,204 @@ Default location if no GPS: Milan, Italy (45.464, 9.190).
 2. All three use **linear interpolation** for vertex attributes at split points
 3. All three generate **per-tile textures** (no shared atlas across tiles)
 4. None of the three use centroid-based triangle assignment for photogrammetry meshes
+
+---
+
+## 12. Performance Deep Dive & Optimization Plan (February 2026)
+
+Empirical performance analysis from processing a real 169M triangle photogrammetry model (16.8 GB OBJ, 8K texture) on an 11-core Apple Silicon machine with 18 GB RAM and NVMe SSD.
+
+### 12.1 Current Performance Profile
+
+**Test model**: `test/Model.obj` -- 169,317,482 triangles, 91,304,901 vertices, 8192x8192 JPEG texture
+
+**Pipeline timing (single run, --validate)**:
+
+| Stage | Duration | Notes |
+|---|---|---|
+| Ingestion (OBJ parse) | ~2.5 min | I/O bound (16.8 GB file read) |
+| Transform (scale, center, ECEF) | ~2 sec | Fast -- simple vertex arithmetic |
+| Tiling (recursive octree + GLB) | ~5 hours | **THE BOTTLENECK** |
+| Validation | ~5-10 min | Reads all GLBs back from disk |
+| **Total** | **~5.5 hours** | |
+
+**Output**: ~5,500 GLB tiles, ~14 GB on disk, max tree depth 6
+
+**Resource utilization during tiling**:
+
+| Resource | Utilization | Capacity | Bottleneck? |
+|---|---|---|---|
+| CPU | 99.9% on **1 of 11 cores** | 11 cores available | **YES -- single-threaded** |
+| RAM | 3 GB (17%) | 18 GB | No |
+| Disk I/O | 3-14 MB/s | ~3 GB/s (NVMe) | No |
+| GPU | 0% | Not used | No |
+
+The pipeline is **purely CPU-bound and single-threaded**. 10 of 11 CPU cores sit idle throughout the 5-hour tiling stage.
+
+### 12.2 Bottleneck Breakdown
+
+#### #1: Triangle Clipper -- Sutherland-Hodgman (est. 30-40% of tiling time)
+
+**Location**: `src/tiling/triangle_clipper.rs`
+
+Every boundary-straddling triangle (~95% of all triangles) is clipped against all 8 octants x 6 planes = 48 clipping operations per triangle. For 169M triangles:
+
+- 169M x 0.95 x 48 = **7.7 billion polygon clipping operations**
+- Each boundary triangle clones 3 `ClipVertex` structs (96 bytes each) 8 times = 24 clones/triangle
+- No pre-filtering: tests all 8 octants even when a triangle only touches 2-3
+- No early exit: fully-clipped-away triangles still do work
+
+**Fix**: Pre-compute an octant bitmask from the triangle's AABB. Only clip against the 2-4 octants the triangle actually overlaps. Expected 3-5x speedup on the clipper alone.
+
+#### #2: WebP Texture Encoding (est. 25% of tiling time)
+
+**Location**: `src/tiling/texture_compress.rs`
+
+Each tile's atlas is encoded to WebP synchronously on the single thread:
+
+- ~5,500 tiles x ~2K atlas each
+- WebP encoding ~1-2 sec/tile on modern CPU
+- **5,500 tiles x 1.5s = ~2.3 hours just for WebP**
+- Uses `image` crate's `write_to()` -- no SIMD, no parallelism
+
+**Fix**: Parallelizing `build_tile_recursive()` (see #3) would automatically parallelize WebP encoding since it happens inside the recursive function. Additionally, switching to KTX2/ETC1S (via `basis-universal` crate) would be 2-3x faster to encode and better for GPU memory at runtime.
+
+#### #3: Sequential Recursive Tiling (est. 20% structural overhead)
+
+**Location**: `src/tiling/tileset_writer.rs`
+
+The core `build_tile_recursive()` function processes children in a sequential `for` loop:
+
+```rust
+for (i, sub) in sub_meshes.into_iter().enumerate() {
+    let child = build_tile_recursive(sub, ...);  // blocks until complete
+}
+```
+
+All shared arguments (`materials`, `texture_config`, `out_dir`) are immutable references -- **this is trivially parallelizable** with rayon's `into_par_iter()`. The `rayon` crate is already in `Cargo.toml` but unused in the main tiling path.
+
+**Fix**: Replace the `for` loop with `into_par_iter()`. At depth 0, this immediately utilizes 4-8 cores (one per non-empty octant). At depth 2+, the work-stealing scheduler spreads 64+ subtrees across all 11 cores. Expected 8-11x speedup.
+
+#### #4: Atlas Repacking -- UV Islands + Compositing (est. 10%)
+
+**Location**: `src/tiling/atlas_repacker.rs`
+
+Two sub-problems:
+- **UV island detection** uses O(n^2) edge-pair checking in pathological cases (edges shared by many faces)
+- **Image compositing** is pixel-by-pixel via `put_pixel()` -- no SIMD batching
+- 5,500 tiles x 4M pixels = **22 billion pixel operations**
+
+**Fix**: Use `copy_from_slice()` for scanline-based blitting instead of per-pixel. Consider `image::imageops` for bulk operations. Would parallelize for free with fix #3.
+
+#### #5: Mesh Cloning Cascade (est. 5%)
+
+**Locations**: `src/tiling/simplifier.rs`, `src/tiling/tileset_writer.rs`
+
+Each recursive node: `simplify_mesh()` clones the mesh, `compact_mesh()` allocates new attribute arrays, `split_mesh()` creates 8 new meshes. For 169M triangles:
+
+- ~5,500 tiles x ~4 GB temporary allocations per simplify = **~22 TB of memory traffic** (temporary, but thrashes allocator)
+- `compact_mesh()` does 3 passes: build remap, remap indices, copy attributes
+
+**Fix**: Use `Cow<[f32]>` for attribute arrays. Skip compaction at deep levels where meshes are small. Use in-place index remapping.
+
+#### #6: Simplification Double-Scan (est. 5%)
+
+**Location**: `src/tiling/simplifier.rs`
+
+Three sequential passes: meshopt simplify -> vertex cache optimize -> compact. The compact pass re-scans all indices and copies all attribute arrays. For the root level (169M triangles), this is 500M+ index scans.
+
+**Fix**: Use `meshopt::simplify_sloppy()` for deep tree levels (5-6x faster, 20M tri/sec vs 3M tri/sec). Skip vertex cache optimization for intermediate nodes (only leaves are rendered at full detail).
+
+### 12.3 Competitive Benchmarks
+
+#### Cesium Reality Tiler V2 (C++, closed-source, December 2024)
+
+Source: [cesium.com/blog/2024/12/11/reality-tiler-v2](https://cesium.com/blog/2024/12/11/reality-tiler-v2-improves-tiling-time-and-memory-usage/)
+
+| Dataset | Triangles | V1 Time | V2 Time | V2 Peak RAM |
+|---|---|---|---|---|
+| Carrick Hill | 3.3M | 2m 37s | **1m 11s** | 14.9 GB |
+| Liverpool | 7.8M | 8m 48s | **2m 54s** | 22.7 GB |
+| Budapest | 43.1M | 59m 05s | **14m 08s** | 21.3 GB |
+| Melbourne | 69.9M | 3h 22m | **27m 58s** | 26.9 GB |
+| **169M (extrapolated)** | **169M** | **~8 hours** | **~40-60 min** | **~35-50 GB** |
+
+V2 key optimizations over V1:
+- Multi-core spatial parallelism (concurrent octant processing)
+- Out-of-core memory-mapped files on NVMe SSD
+- Non-uniform adaptive octree (better balanced than uniform)
+- KTX2/ETC1S texture compression (faster than WebP, 80% GPU memory savings)
+- Tile size uniformity: average tile 395 KB (SD 192 KB) vs V1's 1.28 MB (SD 706 KB)
+
+#### Other Open-Source Tools
+
+| Tool | Language | 100M+ tri est. | Notes |
+|---|---|---|---|
+| **Obj2Tiles** | C# (.NET) | 5-24+ hours | Multi-threaded B3DM stage only. OOMs on large models. Community reports 2 GB model = 5 hours. |
+| **mago3d-tiler** | Java 21 | Unknown (hours) | Phase 2 (tiling) is single-threaded. No published benchmarks. |
+| **py3dtiles** | Python | N/A | Mesh support not production-ready (funded by NLnet, in development). Point cloud only. |
+| **Tyler** | Rust | N/A | CityJSON only, not photogrammetry meshes. Uses rayon for parallel feature indexing. |
+| **FME** | Commercial | Unknown | Does not split meshes -- requires pre-splitting. No published mesh tiling benchmarks. |
+
+**There are no other known Rust-based photogrammetry-to-3DTiles tools.**
+
+#### Photo-Tiler Current vs Competitors
+
+| Tool | 169M tri (est.) | Parallelism | Architecture |
+|---|---|---|---|
+| **Cesium V2** | ~40-60 min | Full multi-core + out-of-core | Best-in-class (closed source) |
+| **Cesium V1** | ~8 hours | Limited | Similar arch to Photo-Tiler current |
+| **Photo-Tiler (current)** | **~5.5 hours** | Single-threaded | On par with Cesium V1 |
+| **Photo-Tiler (optimized)** | **~15-30 min** | Full multi-core | Target: match/beat Cesium V2 |
+
+### 12.4 Optimization Roadmap
+
+Ranked by impact-to-effort ratio:
+
+| Priority | Fix | Speedup | Effort | Details |
+|---|---|---|---|---|
+| **P0** | Parallelize `build_tile_recursive()` via `into_par_iter()` | **8-11x** | Low (2-line change) | All child octants processed concurrently. All downstream work (simplify, clip, atlas, WebP) parallelized for free. |
+| **P1** | Smarter triangle clipper (octant bitmask pre-filter) | **3-5x** | Medium | Pre-compute which octants a triangle overlaps from its AABB. Skip clipping against octants it cannot touch. Reduces 48 clip ops to ~8-12. |
+| **P2** | Use `meshopt::simplify_sloppy()` for depth >= 3 | **2-3x on simplify** | Low | 20M tri/sec vs 3M tri/sec. Quality loss acceptable for coarse LODs. |
+| **P3** | KTX2/ETC1S textures (via `basis-universal`) | **2-3x on encode** | Medium | Faster encoding than WebP. Smaller files. GPU-native transcoding at runtime. |
+| **P4** | SIMD atlas compositing (`copy_from_slice` scanlines) | **2x on atlas** | Medium | Replace per-pixel `put_pixel()` with scanline bulk copies. |
+| **P5** | Out-of-core processing (memory-mapped meshes) | RAM savings | High | Required for models > available RAM. Cesium V2 reduced 134 GB to 27 GB peak via mmap. |
+| **P6** | Skip compaction at leaf level | **1.5x on simplify** | Low | Leaf meshes are small; compaction overhead > savings. |
+
+**Combined estimated speedup**: 20-40x (limited by Amdahl's law on serial fractions)
+
+**P0 alone** would bring the 169M triangle model from **~5.5 hours to ~30-45 minutes**, competitive with Cesium V2.
+
+### 12.5 Benchmark Results (Microbenchmarks via Criterion)
+
+Test hardware: 11-core Apple Silicon, 18 GB RAM
+
+| Benchmark | Input Size | Time | Throughput |
+|---|---|---|---|
+| `simplify_mesh_50pct_100k` | 100K triangles, 50% target | 10.636 ms | 9.4M tri/sec |
+| `simplify_mesh_25pct_100k` | 100K triangles, 25% target | 10.690 ms | 9.4M tri/sec |
+| `lod_chain_4_levels_100k` | 100K triangles, 4 LOD levels | 15.588 ms | 6.4M tri/sec |
+| `split_mesh_clipping_88k` | 88K triangles, octree split | 14.985 ms | 5.9M tri/sec |
+| `split_mesh_with_attrs_17k` | 17K triangles with UVs/normals | 3.792 ms | 4.5M tri/sec |
+| `build_octree_depth4_88k` | 88K triangles, depth 4 | 21.301 ms | 4.1M tri/sec |
+
+The per-operation throughput is reasonable (meshopt is well-optimized). The performance problem is entirely structural: **sequential recursion prevents utilizing available parallelism**.
+
+### 12.6 Key Architectural Insight
+
+From Cesium's spatial subdivision blog post (2017) and Reality Tiler V2 architecture:
+
+> Once you spatially subdivide, each octant is completely independent. The children share only immutable data (materials, config, output path). This is the natural parallelism boundary.
+
+Photo-Tiler's `build_tile_recursive()` already has this property -- the children share only `&MaterialLibrary`, `&TextureConfig`, and `&Path`, all immutable references. The `for` loop to `into_par_iter()` change is the single highest-impact optimization available.
+
+Sources:
+- [Reality Tiler V2 Benchmarks (Cesium, Dec 2024)](https://cesium.com/blog/2024/12/11/reality-tiler-v2-improves-tiling-time-and-memory-usage/)
+- [Reality Tiler Architecture (Cesium, Nov 2023)](https://cesium.com/blog/2023/11/01/new-reality-tiler/)
+- [Cesium On-Premises Reality Tiler Docs](https://cesium.com/learn/3d-tiling/on-prem/on-prem-reality-tiler/)
+- [Optimizing Spatial Subdivisions in Practice (Cesium, 2017)](https://cesium.com/blog/2017/04/04/spatial-subdivision-in-practice/)
+- [meshoptimizer Performance (zeux)](https://meshoptimizer.org/)
+- [OpenDroneMap/Obj2Tiles GitHub](https://github.com/OpenDroneMap/Obj2Tiles)
+- [Gaia3D/mago-3d-tiler GitHub](https://github.com/Gaia3D/mago-3d-tiler)
+- [3DGI/tyler GitHub (Rust)](https://github.com/3DGI/tyler)
+- [Fast Out-of-Core Octree Generation (Schutz 2020)](https://onlinelibrary.wiley.com/doi/10.1111/cgf.14134)

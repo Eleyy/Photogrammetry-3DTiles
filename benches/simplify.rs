@@ -56,7 +56,7 @@ fn bench_lod_chain(c: &mut Criterion) {
     };
 
     c.bench_function("lod_chain_4_levels_100k", |b| {
-        b.iter(|| generate_lod_chain(&mesh, &bounds, 4));
+        b.iter(|| generate_lod_chain(mesh.clone(), &bounds, 4));
     });
 }
 

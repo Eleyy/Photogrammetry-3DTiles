@@ -13,23 +13,107 @@ pub fn compress_texture(image: &RgbaImage, config: &TextureConfig) -> TextureDat
     match config.format {
         TextureFormat::WebP => encode_webp(image, width, height),
         TextureFormat::Original => encode_png(image, width, height),
-        TextureFormat::Ktx2 => {
-            warn!("KTX2 not yet supported, falling back to WebP");
-            encode_webp(image, width, height)
+        TextureFormat::Ktx2 => encode_ktx2(image, width, height, config.quality),
+    }
+}
+
+/// Encode an RGBA image to Basis Universal format (UASTC mode for high quality).
+///
+/// When the `ktx2` feature is enabled, uses the basis-universal crate.
+/// Otherwise, falls back to WebP with a warning.
+fn encode_ktx2(image: &RgbaImage, width: u32, height: u32, quality: u8) -> TextureData {
+    #[cfg(feature = "ktx2")]
+    {
+        match encode_basis_universal(image, width, height, quality) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Basis Universal encoding failed ({e}), falling back to WebP");
+                encode_webp(image, width, height)
+            }
         }
     }
+
+    #[cfg(not(feature = "ktx2"))]
+    {
+        let _ = quality;
+        warn!("KTX2 support requires the 'ktx2' feature flag, falling back to WebP");
+        encode_webp(image, width, height)
+    }
+}
+
+#[cfg(feature = "ktx2")]
+fn encode_basis_universal(
+    image: &RgbaImage,
+    width: u32,
+    height: u32,
+    quality: u8,
+) -> std::result::Result<TextureData, String> {
+    use basis_universal::encoding::{
+        encoder_init, ColorSpace, Compressor, CompressorParams,
+    };
+    use basis_universal::{BasisTextureFormat, UASTC_QUALITY_MAX, UASTC_QUALITY_MIN};
+
+    // Initialize the encoder (thread-safe, idempotent)
+    encoder_init();
+
+    let mut params = CompressorParams::new();
+    params.set_basis_format(BasisTextureFormat::UASTC4x4);
+
+    // Map quality 0-100 to UASTC quality levels
+    let uastc_quality = match quality {
+        0..=20 => UASTC_QUALITY_MIN,
+        21..=50 => 1,
+        51..=75 => 2,
+        76..=90 => 3,
+        _ => UASTC_QUALITY_MAX,
+    };
+    params.set_uastc_quality_level(uastc_quality);
+
+    // Enable RDO for better compression ratios
+    params.set_rdo_uastc(Some(1.0));
+    params.set_generate_mipmaps(false);
+    params.set_color_space(ColorSpace::Srgb);
+
+    // Set source image data
+    let rgba_bytes = image.as_raw();
+    params.source_image_mut(0).init(rgba_bytes, width, height, 4);
+
+    // Compress
+    let mut compressor = Compressor::new(4); // Use up to 4 threads
+    // SAFETY: params and compressor are valid, encoder_init() was called
+    unsafe {
+        compressor.init(&params);
+        compressor
+            .process()
+            .map_err(|e| format!("Compressor process failed: {e:?}"))?;
+    }
+
+    let basis_data = compressor.basis_file().to_vec();
+    if basis_data.is_empty() {
+        return Err("Basis Universal produced empty output".into());
+    }
+
+    Ok(TextureData {
+        data: basis_data,
+        mime_type: "image/ktx2".into(),
+        width,
+        height,
+    })
 }
 
 fn encode_webp(image: &RgbaImage, width: u32, height: u32) -> TextureData {
     let mut buf = Cursor::new(Vec::new());
-    image
-        .write_to(&mut buf, ImageFormat::WebP)
-        .expect("WebP encoding failed");
-    TextureData {
-        data: buf.into_inner(),
-        mime_type: "image/webp".into(),
-        width,
-        height,
+    match image.write_to(&mut buf, ImageFormat::WebP) {
+        Ok(()) => TextureData {
+            data: buf.into_inner(),
+            mime_type: "image/webp".into(),
+            width,
+            height,
+        },
+        Err(e) => {
+            warn!("WebP encoding failed ({e}), falling back to PNG");
+            encode_png(image, width, height)
+        }
     }
 }
 
@@ -118,13 +202,20 @@ mod tests {
     }
 
     #[test]
-    fn ktx2_falls_back_to_webp() {
-        let img = checkerboard(2);
+    fn ktx2_encoding() {
+        let img = checkerboard(4);
         let config = TextureConfig {
             format: TextureFormat::Ktx2,
             ..Default::default()
         };
         let td = compress_texture(&img, &config);
-        assert_eq!(td.mime_type, "image/webp");
+        // With ktx2 feature: produces image/ktx2
+        // Without ktx2 feature: falls back to image/webp
+        assert!(
+            td.mime_type == "image/ktx2" || td.mime_type == "image/webp",
+            "KTX2 should produce ktx2 or fallback to webp, got {}",
+            td.mime_type
+        );
+        assert!(!td.data.is_empty());
     }
 }

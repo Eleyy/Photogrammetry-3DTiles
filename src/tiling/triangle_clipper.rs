@@ -19,17 +19,35 @@ struct ClipPlane {
     positive: bool, // true = keep where pos[axis] >= value
 }
 
-/// Quantized position key for deduplication at boundaries (1µm precision).
+/// Quantized vertex key for deduplication at boundaries (position + UV + normal).
+///
+/// Hashing only position would merge vertices at UV seams (same position,
+/// different UVs), corrupting texture coordinates after the first octree split.
 #[derive(Hash, Eq, PartialEq)]
-struct PositionKey([i64; 3]);
+struct DedupKey {
+    pos: [i64; 3],
+    uv: [i64; 2],
+    normal: [i64; 3],
+}
 
-impl PositionKey {
-    fn from_pos(pos: [f64; 3]) -> Self {
-        Self([
-            (pos[0] * 1e6).round() as i64,
-            (pos[1] * 1e6).round() as i64,
-            (pos[2] * 1e6).round() as i64,
-        ])
+impl DedupKey {
+    fn new(v: &ClipVertex) -> Self {
+        Self {
+            pos: [
+                (v.pos[0] * 1e6).round() as i64,
+                (v.pos[1] * 1e6).round() as i64,
+                (v.pos[2] * 1e6).round() as i64,
+            ],
+            uv: [
+                (v.uv[0] * 1e6).round() as i64,
+                (v.uv[1] * 1e6).round() as i64,
+            ],
+            normal: [
+                (v.normal[0] * 1e4).round() as i64,
+                (v.normal[1] * 1e4).round() as i64,
+                (v.normal[2] * 1e4).round() as i64,
+            ],
+        }
     }
 }
 
@@ -212,7 +230,7 @@ struct OctantMeshBuilder {
     uvs: Vec<f32>,
     colors: Vec<f32>,
     indices: Vec<u32>,
-    dedup: HashMap<PositionKey, u32>,
+    dedup: HashMap<DedupKey, u32>,
     has_normals: bool,
     has_uvs: bool,
     has_colors: bool,
@@ -233,9 +251,9 @@ impl OctantMeshBuilder {
         }
     }
 
-    /// Add a vertex (dedup by quantized position), return its index.
+    /// Add a vertex (dedup by quantized position + UV + normal), return its index.
     fn add_vertex(&mut self, v: &ClipVertex) -> u32 {
-        let key = PositionKey::from_pos(v.pos);
+        let key = DedupKey::new(v);
         if let Some(&idx) = self.dedup.get(&key) {
             return idx;
         }
@@ -327,15 +345,31 @@ pub fn split_mesh_clipping(mesh: &IndexedMesh, bounds: &BoundingBox) -> [Indexed
             let v2 = extract_clip_vertex(mesh, i2);
             builders[oct0].add_triangle(&v0, &v1, &v2);
         } else {
-            // Slow path: triangle straddles boundary — clip against each candidate octant
+            // Slow path: triangle straddles boundary — clip against candidate octants
             let v0 = extract_clip_vertex(mesh, i0);
             let v1 = extract_clip_vertex(mesh, i1);
             let v2 = extract_clip_vertex(mesh, i2);
 
-            // Only clip against octants that the triangle might touch.
-            // The triangle can only be in octants covered by its vertices' octant indices.
-            // For simplicity and correctness, test all 8 octants for boundary triangles.
+            // AABB pre-filter: compute triangle bounding box, skip non-overlapping octants
+            let tri_min = [
+                p0[0].min(p1[0]).min(p2[0]),
+                p0[1].min(p1[1]).min(p2[1]),
+                p0[2].min(p1[2]).min(p2[2]),
+            ];
+            let tri_max = [
+                p0[0].max(p1[0]).max(p2[0]),
+                p0[1].max(p1[1]).max(p2[1]),
+                p0[2].max(p1[2]).max(p2[2]),
+            ];
+
             for (oct_idx, cb) in child_boxes.iter().enumerate() {
+                // Skip octants that don't overlap with the triangle's AABB
+                if tri_min[0] > cb.max[0] || tri_max[0] < cb.min[0]
+                    || tri_min[1] > cb.max[1] || tri_max[1] < cb.min[1]
+                    || tri_min[2] > cb.max[2] || tri_max[2] < cb.min[2]
+                {
+                    continue;
+                }
                 let clipped = clip_triangle_to_octant(
                     [v0.clone(), v1.clone(), v2.clone()],
                     cb,
@@ -604,6 +638,68 @@ mod tests {
 
         // Adjacent octants should share vertex positions at the boundary
         assert!(boundary_positions.len() >= 2, "boundary vertices should appear in multiple octants");
+    }
+
+    #[test]
+    fn split_mesh_preserves_uv_seams() {
+        // Two triangles sharing a position vertex but with DIFFERENT UVs (UV seam).
+        // Vertex 1 appears twice with different UVs: (0.5, 0.0) and (0.5, 1.0).
+        let mesh = IndexedMesh {
+            positions: vec![
+                // Tri 1: v0, v1, v2
+                0.25, 0.25, 0.25,   // v0
+                0.75, 0.25, 0.25,   // v1 (shared position)
+                0.5,  0.4,  0.25,   // v2
+                // Tri 2: v3 (same pos as v1), v4, v5
+                0.75, 0.25, 0.25,   // v3 (same position as v1, different UV)
+                0.75, 0.4,  0.25,   // v4
+                0.5,  0.4,  0.25,   // v5
+            ],
+            normals: vec![],
+            uvs: vec![
+                0.0, 0.0,  // v0
+                0.5, 0.0,  // v1 (UV seam side A)
+                0.25, 0.5, // v2
+                0.5, 1.0,  // v3 (UV seam side B — different UV!)
+                1.0, 1.0,  // v4
+                0.25, 0.5, // v5
+            ],
+            colors: vec![],
+            indices: vec![0, 1, 2, 3, 4, 5],
+            material_index: None,
+        };
+
+        let bounds = BoundingBox {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 1.0, 1.0],
+        };
+
+        let children = split_mesh_clipping(&mesh, &bounds);
+
+        // Collect all UV values at the shared position (0.75, 0.25, 0.25)
+        let mut uvs_at_shared_pos = Vec::new();
+        for child in &children {
+            if child.is_empty() || !child.has_uvs() {
+                continue;
+            }
+            for vi in 0..child.vertex_count() {
+                let x = child.positions[vi * 3];
+                let y = child.positions[vi * 3 + 1];
+                let z = child.positions[vi * 3 + 2];
+                if (x - 0.75).abs() < 1e-4 && (y - 0.25).abs() < 1e-4 && (z - 0.25).abs() < 1e-4 {
+                    uvs_at_shared_pos.push([child.uvs[vi * 2], child.uvs[vi * 2 + 1]]);
+                }
+            }
+        }
+
+        // Both UV values should survive (the DedupKey distinguishes them)
+        let has_uv_a = uvs_at_shared_pos.iter().any(|uv| (uv[1] - 0.0).abs() < 0.01);
+        let has_uv_b = uvs_at_shared_pos.iter().any(|uv| (uv[1] - 1.0).abs() < 0.01);
+        assert!(
+            has_uv_a && has_uv_b,
+            "Both UV seam values should survive split. Found UVs: {:?}",
+            uvs_at_shared_pos
+        );
     }
 
     /// Helper: compute area of a triangle from a flat f32 positions array.

@@ -2,7 +2,6 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use gltf::binary::Glb;
-use rayon::prelude::*;
 use tracing::{info, warn};
 
 use crate::config::PipelineConfig;
@@ -65,7 +64,7 @@ impl Pipeline {
                 config.output.display()
             ))
         })?;
-        let tile_count = Self::tile(config, &transform_result)?;
+        let tile_count = Self::tile(config, transform_result)?;
 
         if config.validate {
             info!("Stage 4/4: Validation");
@@ -81,12 +80,22 @@ impl Pipeline {
         })
     }
 
-    fn tile(config: &PipelineConfig, transform_result: &TransformResult) -> Result<usize> {
-        let max_lod_levels = 4;
+    fn tile(config: &PipelineConfig, transform_result: TransformResult) -> Result<usize> {
+        let max_lod_levels = 1;
 
-        let lod_chains: Vec<_> = transform_result
-            .meshes
-            .par_iter()
+        // Destructure to take ownership of fields individually
+        let TransformResult {
+            meshes,
+            bounds,
+            materials,
+            root_transform,
+        } = transform_result;
+
+        let mesh_count = meshes.len();
+
+        // Move meshes into LOD generation (no extra copies)
+        let lod_chains: Vec<_> = meshes
+            .into_iter()
             .enumerate()
             .map(|(i, mesh)| {
                 info!(
@@ -96,8 +105,7 @@ impl Pipeline {
                     "Generating LOD chain"
                 );
 
-                let chain =
-                    lod::generate_lod_chain(mesh, &transform_result.bounds, max_lod_levels);
+                let chain = lod::generate_lod_chain(mesh, &bounds, max_lod_levels);
 
                 for level in &chain.levels {
                     info!(
@@ -115,28 +123,26 @@ impl Pipeline {
 
         let total_lod_levels: usize = lod_chains.iter().map(|c| c.levels.len()).sum();
         info!(
-            meshes = transform_result.meshes.len(),
+            meshes = mesh_count,
             total_lod_levels,
             "LOD generation complete"
         );
 
-        // Build tile hierarchy
+        // Build tile hierarchy and write GLBs eagerly to disk
         info!("Building tile hierarchy");
         let tileset_output = tileset_writer::build_tileset(
-            &lod_chains,
-            &transform_result.bounds,
+            lod_chains,
+            &bounds,
             &config.tiling,
-            &transform_result.materials,
+            &materials,
             &config.texture,
+            &config.output,
         );
 
-        // Write tileset to output directory
-        info!(output = %config.output.display(), "Writing tileset");
-        let tile_count = tileset_writer::write_tileset(
-            &tileset_output,
-            &transform_result.root_transform,
-            &config.output,
-        )?;
+        // Write tileset.json (GLBs already on disk)
+        info!(output = %config.output.display(), "Writing tileset.json");
+        let tile_count =
+            tileset_writer::write_tileset(&tileset_output, &root_transform, &config.output)?;
 
         Ok(tile_count)
     }

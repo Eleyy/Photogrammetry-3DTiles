@@ -39,7 +39,7 @@ const MIN_TRIANGLE_COUNT: usize = 1000;
 /// Stops when `max_levels` is reached, triangle count drops below 1000,
 /// or simplification can't reduce further.
 pub fn generate_lod_chain(
-    mesh: &IndexedMesh,
+    mesh: IndexedMesh,
     bounds: &BoundingBox,
     max_levels: u32,
 ) -> LodChain {
@@ -47,33 +47,37 @@ pub fn generate_lod_chain(
     let mut levels = Vec::new();
 
     // LOD 0: original mesh (finest detail → zero geometric error)
+    // Takes ownership -- no clone needed.
     levels.push(LodLevel {
         level: 0,
-        mesh: mesh.clone(),
+        mesh,
         geometric_error: 0.0,
     });
 
-    if mesh.is_empty() || max_levels <= 1 {
+    if levels[0].mesh.is_empty() || max_levels <= 1 {
         return LodChain {
             levels,
             bounds: *bounds,
         };
     }
 
-    let original_index_count = mesh.indices.len();
-    let mut prev_triangle_count = mesh.triangle_count();
+    let mut prev_triangle_count = levels[0].mesh.triangle_count();
+    let mut cumulative_error = 0.0_f64;
 
     for n in 1..max_levels {
-        let ratio = 0.25_f32.powi(n as i32);
+        // Cascade: simplify from previous level (not from LOD 0)
+        let ratio = 0.25_f32;
 
+        let prev_level = &levels[n as usize - 1];
         info!(
             level = n,
             ratio,
-            target_triangles = (original_index_count as f64 * ratio as f64 / 3.0) as usize,
-            "Generating LOD level"
+            source_triangles = prev_level.mesh.triangle_count(),
+            target_triangles = (prev_level.mesh.indices.len() as f64 * ratio as f64 / 3.0) as usize,
+            "Generating LOD level (cascaded)"
         );
 
-        let simplified = simplify_mesh(mesh, ratio, true);
+        let simplified = simplify_mesh(&prev_level.mesh, ratio, true);
 
         // Stop if simplification couldn't reduce meaningfully (< 5% reduction)
         let new_triangle_count = simplified.mesh.triangle_count();
@@ -89,13 +93,14 @@ pub fn generate_lod_chain(
             break;
         }
 
-        // meshopt's achieved_error is relative to the mesh extent.
-        // Scale by diagonal to get error in mesh-space units (meters).
-        // Clamp to a minimum so coarser LODs always have strictly
-        // increasing error even when meshopt reports very small values.
+        // Compound error: each level accumulates error from all previous
+        // simplification steps.
         let measured_error = simplified.achieved_error as f64 * diagonal;
-        let min_heuristic_error = diagonal * (1.0 - ratio as f64) * 0.5;
-        let geometric_error = measured_error.max(min_heuristic_error);
+        cumulative_error += measured_error;
+        // Heuristic minimum based on overall reduction from the original
+        let overall_ratio = 0.25_f64.powi(n as i32);
+        let min_heuristic_error = diagonal * (1.0 - overall_ratio) * 0.5;
+        let geometric_error = cumulative_error.max(min_heuristic_error);
 
         levels.push(LodLevel {
             level: n,
@@ -169,7 +174,7 @@ mod tests {
     fn lod_chain_levels_decrease_in_triangles() {
         let mesh = make_grid(100); // 20000 triangles
         let bounds = unit_bounds();
-        let chain = generate_lod_chain(&mesh, &bounds, 4);
+        let chain = generate_lod_chain(mesh, &bounds, 4);
 
         assert!(chain.levels.len() >= 2, "Should produce at least 2 LOD levels");
 
@@ -190,7 +195,7 @@ mod tests {
     fn lod_chain_geometric_error_increases() {
         let mesh = make_grid(100);
         let bounds = unit_bounds();
-        let chain = generate_lod_chain(&mesh, &bounds, 4);
+        let chain = generate_lod_chain(mesh, &bounds, 4);
 
         for i in 1..chain.levels.len() {
             assert!(
@@ -207,14 +212,12 @@ mod tests {
     #[test]
     fn lod_chain_lod0_is_original() {
         let mesh = make_grid(20);
+        let tris = mesh.triangle_count();
         let bounds = unit_bounds();
-        let chain = generate_lod_chain(&mesh, &bounds, 4);
+        let chain = generate_lod_chain(mesh, &bounds, 4);
 
         assert_eq!(chain.levels[0].level, 0);
-        assert_eq!(
-            chain.levels[0].mesh.triangle_count(),
-            mesh.triangle_count()
-        );
+        assert_eq!(chain.levels[0].mesh.triangle_count(), tris);
     }
 
     #[test]
@@ -224,7 +227,7 @@ mod tests {
             min: [0.0; 3],
             max: [0.0; 3],
         };
-        let chain = generate_lod_chain(&mesh, &bounds, 4);
+        let chain = generate_lod_chain(mesh, &bounds, 4);
         assert_eq!(chain.levels.len(), 1); // Only LOD 0
     }
 
@@ -232,7 +235,7 @@ mod tests {
     fn lod_chain_respects_max_levels() {
         let mesh = make_grid(100);
         let bounds = unit_bounds();
-        let chain = generate_lod_chain(&mesh, &bounds, 2);
+        let chain = generate_lod_chain(mesh, &bounds, 2);
         assert!(chain.levels.len() <= 2);
     }
 
@@ -240,7 +243,7 @@ mod tests {
     fn lod_chain_bounds_preserved() {
         let bounds = unit_bounds();
         let mesh = make_grid(20);
-        let chain = generate_lod_chain(&mesh, &bounds, 4);
+        let chain = generate_lod_chain(mesh, &bounds, 4);
         assert_eq!(chain.bounds, bounds);
     }
 }

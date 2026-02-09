@@ -164,7 +164,14 @@ fn full_pipeline_textured_obj() {
     let root_glb_path = tiles_dir.join("root.glb");
     assert!(root_glb_path.exists(), "root.glb should exist");
     let root_glb_data = fs::read(&root_glb_path).unwrap();
-    let (doc, _bufs, images) = gltf::import_slice(&root_glb_data).unwrap();
+
+    // Use from_slice_without_validation because compressed GLBs use
+    // EXT_meshopt_compression which the gltf crate doesn't support in validation.
+    let gltf_data = gltf::Gltf::from_slice_without_validation(&root_glb_data).unwrap();
+    let buffers =
+        gltf::import_buffers(&gltf_data.document, None, gltf_data.blob.clone()).unwrap();
+    let images = gltf::import_images(&gltf_data.document, None, &buffers).unwrap();
+    let doc = gltf_data.document;
 
     // Root should have a mesh
     assert!(doc.meshes().next().is_some(), "root GLB should have a mesh");

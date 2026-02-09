@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use rayon::prelude::*;
 use serde_json::json;
@@ -8,9 +8,10 @@ use tracing::info;
 use crate::config::{TextureConfig, TilingConfig};
 use crate::error::{PhotoTilerError, Result};
 use crate::tiling::atlas_repacker;
-use crate::tiling::glb_writer::write_glb;
+use crate::tiling::glb_writer::write_glb_compressed;
 use crate::tiling::lod::LodChain;
-use crate::tiling::octree::{build_octree, OctreeNode};
+use crate::tiling::octree::{child_bounds, split_mesh};
+use crate::tiling::simplifier::simplify_mesh;
 use crate::types::{BoundingBox, IndexedMesh, MaterialLibrary, TileContent, TileNode};
 
 /// Intermediate output of tile hierarchy construction.
@@ -49,89 +50,99 @@ fn address_to_uri(address: &str) -> String {
     format!("tiles/{dir_path}/tile.glb")
 }
 
-/// Write a tile's GLB, using atlas repacking when textures are enabled.
-fn write_tile_glb(
+/// Write a tile's GLB using atlas repacking when textures are enabled,
+/// then eagerly flush to disk and free the data.
+///
+/// Applies vertex cache optimization before writing to improve GPU
+/// rendering performance and meshopt compression ratios.
+fn write_tile_glb_to_disk(
     mesh: &IndexedMesh,
     materials: &MaterialLibrary,
     texture_config: &TextureConfig,
-) -> Vec<u8> {
-    if texture_config.enabled && mesh.has_uvs() {
-        if let Some(result) = atlas_repacker::repack_atlas(mesh, materials, texture_config) {
-            return write_glb(&result.mesh, materials, Some(&result.atlas_texture));
+    out_dir: &Path,
+    address: &str,
+) -> TileContent {
+    // Vertex cache optimization: improves GPU rendering perf and compression ratios
+    let mesh = if !mesh.is_empty() {
+        let optimized_indices = meshopt::optimize_vertex_cache(&mesh.indices, mesh.vertex_count());
+        &IndexedMesh {
+            positions: mesh.positions.clone(),
+            normals: mesh.normals.clone(),
+            uvs: mesh.uvs.clone(),
+            colors: mesh.colors.clone(),
+            indices: optimized_indices,
+            material_index: mesh.material_index,
         }
+    } else {
+        mesh
+    };
+
+    let glb_data = if texture_config.enabled && mesh.has_uvs() {
+        if let Some(result) = atlas_repacker::repack_atlas(mesh, materials, texture_config) {
+            write_glb_compressed(&result.mesh, materials, Some(&result.atlas_texture))
+        } else {
+            write_glb_compressed(mesh, materials, None)
+        }
+    } else {
+        write_glb_compressed(mesh, materials, None)
+    };
+
+    let uri = address_to_uri(address);
+    let glb_path = out_dir.join(&uri);
+
+    // Write to disk immediately
+    if let Some(parent) = glb_path.parent() {
+        let _ = fs::create_dir_all(parent);
     }
-    write_glb(mesh, materials, None)
+    if let Err(e) = fs::write(&glb_path, &glb_data) {
+        tracing::error!("Failed to write {}: {e}", glb_path.display());
+    }
+
+    // Return content with empty data (already on disk)
+    TileContent {
+        glb_data: vec![],
+        uri,
+    }
 }
 
-/// Build a tile hierarchy from LOD chains.
+/// Build a tile hierarchy from LOD chains, writing GLBs eagerly to disk.
 ///
-/// Produces a proper N-level hierarchy matching the architecture spec:
-/// ```text
-/// Root (LOD N, coarsest) → children at LOD N-1 → ... → leaves at LOD 0
-/// ```
-///
-/// Each LOD level maps to one tier of the tile tree. The coarsest LOD becomes
-/// the root tile content, intermediate LODs become intermediate tile nodes,
-/// and the finest LOD (LOD 0) octree-splits into leaf tiles.
+/// Merges all LOD-0 meshes into a single mesh, then builds a unified
+/// spatial-LOD hierarchy where every internal node has content (a simplified
+/// mesh of its spatial region) and children are spatial subdivisions.
 pub fn build_tileset(
-    lod_chains: &[LodChain],
+    lod_chains: Vec<LodChain>,
     bounds: &BoundingBox,
     config: &TilingConfig,
     materials: &MaterialLibrary,
     texture_config: &TextureConfig,
+    out_dir: &Path,
 ) -> TilesetOutput {
-    // Collect all LOD levels, merged per level across chains
-    let max_lod = lod_chains
-        .iter()
-        .flat_map(|c| c.levels.iter())
-        .map(|l| l.level)
-        .max()
-        .unwrap_or(0);
-
-    // Merge meshes at each LOD level
-    let mut level_meshes: Vec<(u32, IndexedMesh, f64)> = Vec::new();
-    for lod in 0..=max_lod {
-        let mut merged = IndexedMesh::default();
-        let mut max_error = 0.0_f64;
-        for chain in lod_chains {
-            if let Some(level) = chain.levels.iter().find(|l| l.level == lod) {
-                merged = merge_meshes(&merged, &level.mesh);
-                if level.geometric_error > max_error {
-                    max_error = level.geometric_error;
-                }
-            }
-        }
-        if !merged.is_empty() {
-            level_meshes.push((lod, merged, max_error));
+    // Merge all LOD-0 (finest) meshes into a single mesh
+    let mut merged = IndexedMesh::default();
+    for chain in &lod_chains {
+        if let Some(level) = chain.levels.iter().find(|l| l.level == 0) {
+            merged = merge_meshes(merged, &level.mesh);
         }
     }
 
-    // Sort by LOD level: finest (0) first, coarsest last
-    level_meshes.sort_by_key(|(lod, _, _)| *lod);
+    drop(lod_chains);
 
     let identity = [
         1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
     ];
 
-    if level_meshes.len() <= 1 {
-        // Single-level: octree split the mesh
-        let mesh = if level_meshes.is_empty() {
-            IndexedMesh::default()
-        } else {
-            level_meshes.remove(0).1
-        };
-
-        let tree = build_octree(&mesh, bounds, config.max_depth, config.max_triangles_per_tile);
-        let root = octree_to_tile_node(&tree, "root", 0, bounds, 0.0, materials, texture_config);
-
-        return TilesetOutput {
-            root,
-            root_transform: identity,
-        };
-    }
-
-    // Multi-level hierarchy: build from coarsest (root) down to finest (leaves)
-    let root = build_lod_hierarchy(&level_meshes, bounds, config, materials, texture_config);
+    let root = build_tile_recursive(
+        merged,
+        bounds,
+        0,
+        config.max_depth,
+        config.max_triangles_per_tile,
+        "root",
+        materials,
+        texture_config,
+        out_dir,
+    );
 
     TilesetOutput {
         root,
@@ -139,196 +150,136 @@ pub fn build_tileset(
     }
 }
 
-/// Build a multi-level LOD hierarchy.
+/// Recursively build a unified spatial-LOD tile hierarchy.
 ///
-/// Coarsest LOD → root tile content, each successively finer LOD becomes
-/// children. Finest LOD (LOD 0) → octree-split into leaf tiles.
-fn build_lod_hierarchy(
-    level_meshes: &[(u32, IndexedMesh, f64)],
+/// Each node gets a simplified version of its mesh as display content, while
+/// the original (unsimplified) mesh is spatially subdivided into octant children.
+/// This ensures every internal node has renderable content and the tree combines
+/// both spatial subdivision and LOD at every level.
+///
+/// Leaf condition: `triangle_count <= max_tris` OR `depth >= max_depth`.
+fn build_tile_recursive(
+    mesh: IndexedMesh,
     bounds: &BoundingBox,
-    config: &TilingConfig,
+    depth: u32,
+    max_depth: u32,
+    max_tris: usize,
+    address: &str,
     materials: &MaterialLibrary,
     texture_config: &TextureConfig,
+    out_dir: &Path,
 ) -> TileNode {
-    // level_meshes is sorted finest-first: [LOD0, LOD1, ..., LOD_N]
-    // We want to build: root = LOD_N (coarsest), children = LOD_N-1, ..., leaves = LOD0
-    let num_levels = level_meshes.len();
+    let is_leaf = mesh.triangle_count() <= max_tris || depth >= max_depth;
 
-    // Start from the coarsest level (last in array)
-    let coarsest_idx = num_levels - 1;
-    let (_, ref coarsest_mesh, coarsest_error) = level_meshes[coarsest_idx];
-
-    // Root tile: coarsest LOD
-    let root_glb = write_tile_glb(coarsest_mesh, materials, texture_config);
-    let root_uri = address_to_uri("root");
-
-    // Build children recursively from the next-finer level
-    let children = if num_levels >= 2 {
-        build_lod_children(level_meshes, coarsest_idx - 1, bounds, config, materials, texture_config, "")
+    let geometric_error = if is_leaf {
+        0.0
     } else {
-        vec![]
+        bounds.diagonal() * 0.5_f64.powi(depth as i32)
     };
 
-    TileNode {
-        address: "root".into(),
-        level: 0,
-        bounds: *bounds,
-        geometric_error: coarsest_error,
-        content: Some(TileContent {
-            glb_data: root_glb,
-            uri: root_uri,
-        }),
-        children,
-    }
-}
-
-/// Recursively build children for a LOD level.
-///
-/// For the finest level (LOD 0), octree-split into leaf tiles.
-/// For intermediate levels, create a single tile with the level's mesh as content,
-/// with children from the next finer level.
-fn build_lod_children(
-    level_meshes: &[(u32, IndexedMesh, f64)],
-    current_idx: usize,
-    bounds: &BoundingBox,
-    config: &TilingConfig,
-    materials: &MaterialLibrary,
-    texture_config: &TextureConfig,
-    parent_addr: &str,
-) -> Vec<TileNode> {
-    let (lod_level, ref mesh, geometric_error) = level_meshes[current_idx];
-
-    if current_idx == 0 {
-        // Finest LOD: octree-split into leaf tiles
-        let tree = build_octree(mesh, bounds, config.max_depth, config.max_triangles_per_tile);
-        return octree_children_to_tiles(&tree, bounds, 0, materials, texture_config);
-    }
-
-    // Intermediate LOD: single tile with content, children from next finer level
-    let address = if parent_addr.is_empty() {
-        format!("{lod_level}")
-    } else {
-        format!("{parent_addr}_{lod_level}")
-    };
-
-    let glb_data = write_tile_glb(mesh, materials, texture_config);
-    let uri = address_to_uri(&address);
-
-    let children = build_lod_children(
-        level_meshes,
-        current_idx - 1,
-        bounds,
-        config,
-        materials,
-        texture_config,
-        &address,
-    );
-
-    vec![TileNode {
-        address,
-        level: lod_level,
-        bounds: *bounds,
-        geometric_error,
-        content: Some(TileContent { glb_data, uri }),
-        children,
-    }]
-}
-
-/// Convert an octree into tile nodes for the leaf level of the LOD hierarchy.
-fn octree_children_to_tiles(
-    node: &OctreeNode,
-    _bounds: &BoundingBox,
-    child_counter: usize,
-    materials: &MaterialLibrary,
-    texture_config: &TextureConfig,
-) -> Vec<TileNode> {
-    if node.is_leaf() {
-        if node.mesh.is_empty() {
-            return vec![];
-        }
-        let address = format!("{child_counter}");
-        let glb_data = write_tile_glb(&node.mesh, materials, texture_config);
-        let uri = address_to_uri(&address);
-        return vec![TileNode {
-            address,
-            level: 0,
-            bounds: node.bounds,
-            geometric_error: 0.0,
-            content: Some(TileContent { glb_data, uri }),
-            children: vec![],
-        }];
-    }
-
-    // Internal octree node: recurse into children
-    let mut tiles = Vec::new();
-    let mut counter = child_counter;
-    for child in &node.children {
-        if let Some(c) = child.as_ref() {
-            let sub = octree_to_tile_node_recursive(c, &mut counter, materials, texture_config);
-            tiles.push(sub);
-        }
-    }
-    tiles
-}
-
-/// Recursively convert an OctreeNode into a TileNode with proper addressing.
-fn octree_to_tile_node_recursive(
-    node: &OctreeNode,
-    counter: &mut usize,
-    materials: &MaterialLibrary,
-    texture_config: &TextureConfig,
-) -> TileNode {
-    let address = format!("{counter}");
-    *counter += 1;
-
-    if node.is_leaf() {
-        let content = if !node.mesh.is_empty() {
-            let glb_data = write_tile_glb(&node.mesh, materials, texture_config);
-            let uri = address_to_uri(&address);
-            Some(TileContent { glb_data, uri })
+    if is_leaf {
+        // Leaf: write the full-detail mesh as content, no children
+        let content = if !mesh.is_empty() {
+            Some(write_tile_glb_to_disk(
+                &mesh, materials, texture_config, out_dir, address,
+            ))
         } else {
             None
         };
 
         return TileNode {
-            address,
-            level: 0,
-            bounds: node.bounds,
-            geometric_error: 0.0,
+            address: address.into(),
+            level: depth,
+            bounds: *bounds,
+            geometric_error,
             content,
             children: vec![],
         };
     }
 
-    // Internal octree node
-    let geometric_error = node.bounds.diagonal() * 0.1;
-    let mut children = Vec::new();
-    for child in &node.children {
-        if let Some(c) = child.as_ref() {
-            children.push(octree_to_tile_node_recursive(c, counter, materials, texture_config));
-        }
-    }
+    // Internal node: simplify the mesh for this node's display content,
+    // then spatially split the ORIGINAL mesh for children.
+    // Deeper levels use relaxed simplification (less aggressive, faster).
+    let content_mesh = if mesh.triangle_count() < 64 {
+        // Too few triangles to simplify meaningfully -- use as-is
+        mesh.clone()
+    } else {
+        let (ratio, lock_border) = if depth >= 3 {
+            (0.5, false) // Faster, less aggressive for deep/coarse nodes
+        } else {
+            (0.25, true) // More aggressive for top-level nodes
+        };
+        simplify_mesh(&mesh, ratio, lock_border).mesh
+    };
+
+    let content = if !content_mesh.is_empty() {
+        Some(write_tile_glb_to_disk(
+            &content_mesh, materials, texture_config, out_dir, address,
+        ))
+    } else {
+        None
+    };
+    drop(content_mesh);
+
+    // Split the ORIGINAL mesh spatially into 8 octants
+    let sub_meshes = split_mesh(&mesh, bounds);
+    drop(mesh);
+
+    // Recurse into non-empty octants in parallel
+    let child_tasks: Vec<_> = sub_meshes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, sub)| {
+            if sub.is_empty() {
+                return None;
+            }
+            let child_addr = if address == "root" {
+                format!("{i}")
+            } else {
+                format!("{address}_{i}")
+            };
+            let cb = child_bounds(bounds, i);
+            Some((child_addr, sub, cb))
+        })
+        .collect();
+
+    let children: Vec<TileNode> = child_tasks
+        .into_par_iter()
+        .map(|(child_addr, sub, cb)| {
+            build_tile_recursive(
+                sub,
+                &cb,
+                depth + 1,
+                max_depth,
+                max_tris,
+                &child_addr,
+                materials,
+                texture_config,
+                out_dir,
+            )
+        })
+        .collect();
 
     TileNode {
-        address,
-        level: 0,
-        bounds: node.bounds,
+        address: address.into(),
+        level: depth,
+        bounds: *bounds,
         geometric_error,
-        content: None,
+        content,
         children,
     }
 }
 
-/// Write the tileset to disk: `tileset.json` + hierarchical `tiles/` directory.
+/// Write the tileset.json to disk.
 ///
-/// Returns the total number of tiles written.
+/// GLB files have already been written eagerly during `build_tileset`.
+/// Returns the total number of tiles (content nodes).
 pub fn write_tileset(
     output: &TilesetOutput,
     transform: &[f64; 16],
     out_dir: &Path,
 ) -> Result<usize> {
-    // Write all GLB tile files using parallel I/O
-    let tile_count = write_tile_glbs_parallel(&output.root, out_dir)?;
+    let tile_count = count_content_nodes(&output.root);
 
     // Build tileset.json
     let tileset_json = build_tileset_json(&output.root, transform);
@@ -349,42 +300,10 @@ pub fn write_tileset(
     Ok(tile_count)
 }
 
-/// Collect all (path, data) pairs from the tile tree.
-fn collect_glb_pairs<'a>(node: &'a TileNode, out_dir: &Path, pairs: &mut Vec<(PathBuf, &'a [u8])>) {
-    if let Some(content) = &node.content {
-        let glb_path = out_dir.join(&content.uri);
-        pairs.push((glb_path, &content.glb_data));
-    }
-    for child in &node.children {
-        collect_glb_pairs(child, out_dir, pairs);
-    }
-}
-
-/// Write GLB files in parallel using rayon.
-fn write_tile_glbs_parallel(node: &TileNode, out_dir: &Path) -> Result<usize> {
-    let mut pairs: Vec<(PathBuf, &[u8])> = Vec::new();
-    collect_glb_pairs(node, out_dir, &mut pairs);
-
-    // Create directories (sequential — fast and must happen before writes)
-    for (path, _) in &pairs {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                PhotoTilerError::Output(format!(
-                    "Failed to create dir {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        }
-    }
-
-    // Write files in parallel
-    pairs.par_iter().try_for_each(|(path, data)| {
-        fs::write(path, data).map_err(|e| {
-            PhotoTilerError::Output(format!("Failed to write {}: {e}", path.display()))
-        })
-    })?;
-
-    Ok(pairs.len())
+/// Count nodes that have content (i.e., GLB tiles).
+fn count_content_nodes(node: &TileNode) -> usize {
+    let self_count = if node.content.is_some() { 1 } else { 0 };
+    self_count + node.children.iter().map(count_content_nodes).sum::<usize>()
 }
 
 /// Build the tileset.json as a serde_json::Value.
@@ -450,111 +369,45 @@ fn bounding_volume_box(bounds: &BoundingBox) -> [f64; 12] {
     ]
 }
 
-/// Convert an OctreeNode into a TileNode (used for single-level tilesets).
-fn octree_to_tile_node(
-    node: &OctreeNode,
-    address: &str,
-    level: u32,
-    bounds: &BoundingBox,
-    _parent_error: f64,
-    materials: &MaterialLibrary,
-    texture_config: &TextureConfig,
-) -> TileNode {
-    let geometric_error = if node.is_leaf() {
-        0.0
-    } else {
-        // Internal nodes: error proportional to bounds diagonal
-        bounds.diagonal() * 0.5_f64.powi(level as i32)
-    };
-
-    let content = if !node.mesh.is_empty() {
-        let glb_data = write_tile_glb(&node.mesh, materials, texture_config);
-        let uri = address_to_uri(address);
-        Some(TileContent { glb_data, uri })
-    } else {
-        None
-    };
-
-    let children: Vec<TileNode> = node
-        .children
-        .iter()
-        .enumerate()
-        .filter_map(|(i, child)| {
-            child.as_ref().map(|c| {
-                let child_addr = format!("{address}_{i}");
-                let child_bounds = &c.bounds;
-                octree_to_tile_node(
-                    c,
-                    &child_addr,
-                    level + 1,
-                    child_bounds,
-                    geometric_error,
-                    materials,
-                    texture_config,
-                )
-            })
-        })
-        .collect();
-
-    TileNode {
-        address: address.into(),
-        level,
-        bounds: *bounds,
-        geometric_error,
-        content,
-        children,
-    }
-}
-
-/// Merge two IndexedMeshes by concatenating their buffers and offsetting indices.
-fn merge_meshes(a: &IndexedMesh, b: &IndexedMesh) -> IndexedMesh {
+/// Merge two IndexedMeshes by extending `a` with `b`'s data and offsetting indices.
+/// Takes ownership of `a` to avoid cloning it.
+fn merge_meshes(mut a: IndexedMesh, b: &IndexedMesh) -> IndexedMesh {
     if a.is_empty() {
         return b.clone();
     }
     if b.is_empty() {
-        return a.clone();
+        return a;
     }
 
     let a_vertex_count = a.vertex_count() as u32;
 
-    let mut positions = a.positions.clone();
-    positions.extend_from_slice(&b.positions);
+    a.positions.extend_from_slice(&b.positions);
 
-    let normals = if a.has_normals() && b.has_normals() {
-        let mut n = a.normals.clone();
-        n.extend_from_slice(&b.normals);
-        n
+    if a.has_normals() && b.has_normals() {
+        a.normals.extend_from_slice(&b.normals);
     } else {
-        vec![]
-    };
-
-    let uvs = if a.has_uvs() && b.has_uvs() {
-        let mut u = a.uvs.clone();
-        u.extend_from_slice(&b.uvs);
-        u
-    } else {
-        vec![]
-    };
-
-    let colors = if a.has_colors() && b.has_colors() {
-        let mut c = a.colors.clone();
-        c.extend_from_slice(&b.colors);
-        c
-    } else {
-        vec![]
-    };
-
-    let mut indices = a.indices.clone();
-    indices.extend(b.indices.iter().map(|&i| i + a_vertex_count));
-
-    IndexedMesh {
-        positions,
-        normals,
-        uvs,
-        colors,
-        indices,
-        material_index: a.material_index.or(b.material_index),
+        a.normals.clear();
     }
+
+    if a.has_uvs() && b.has_uvs() {
+        a.uvs.extend_from_slice(&b.uvs);
+    } else {
+        a.uvs.clear();
+    }
+
+    if a.has_colors() && b.has_colors() {
+        a.colors.extend_from_slice(&b.colors);
+    } else {
+        a.colors.clear();
+    }
+
+    a.indices.extend(b.indices.iter().map(|&i| i + a_vertex_count));
+
+    if a.material_index.is_none() {
+        a.material_index = b.material_index;
+    }
+
+    a
 }
 
 #[cfg(test)]
@@ -604,6 +457,13 @@ mod tests {
         ]
     }
 
+    fn tex_config_disabled() -> TextureConfig {
+        TextureConfig {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn build_tileset_single_level() {
         let mesh = make_grid_mesh(4); // 32 triangles
@@ -621,9 +481,16 @@ mod tests {
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
+        let tmp = tempfile::tempdir().unwrap();
 
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
         assert_eq!(output.root.address, "root");
         assert_eq!(output.root.level, 0);
     }
@@ -631,7 +498,6 @@ mod tests {
     #[test]
     fn build_tileset_multi_level() {
         let mesh = make_grid_mesh(10); // 200 triangles
-        let simplified = make_grid_mesh(4); // 32 triangles
 
         let chain = LodChain {
             levels: vec![
@@ -640,70 +506,79 @@ mod tests {
                     mesh: mesh.clone(),
                     geometric_error: 0.0,
                 },
+            ],
+            bounds: unit_bounds(),
+        };
+
+        // Use low max_triangles to force subdivision
+        let config = TilingConfig {
+            max_triangles_per_tile: 50,
+            max_depth: 4,
+        };
+        let materials = MaterialLibrary::default();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+        assert_eq!(output.root.address, "root");
+        assert!(
+            output.root.content.is_some(),
+            "root should have content"
+        );
+        assert!(
+            output.root.geometric_error > 0.0,
+            "root should have positive geometric error"
+        );
+        // With subdivision forced, root should have children
+        assert!(
+            !output.root.children.is_empty(),
+            "subdivided tileset root should have children"
+        );
+    }
+
+    #[test]
+    fn build_tileset_four_lods() {
+        // With the new unified approach, we only use LOD-0 meshes.
+        // Pass a large mesh and force subdivision via low max_triangles.
+        let lod0 = make_grid_mesh(16); // 512 tris
+
+        let chain = LodChain {
+            levels: vec![
                 LodLevel {
-                    level: 1,
-                    mesh: simplified.clone(),
-                    geometric_error: 0.5,
+                    level: 0,
+                    mesh: lod0,
+                    geometric_error: 0.0,
                 },
             ],
             bounds: unit_bounds(),
         };
 
         let config = TilingConfig {
-            max_triangles_per_tile: 100_000,
+            max_triangles_per_tile: 50,
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
+        let tmp = tempfile::tempdir().unwrap();
 
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
-        assert_eq!(output.root.address, "root");
-        assert!(
-            output.root.content.is_some(),
-            "root should have content (coarsest LOD)"
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
         );
-        assert!(
-            output.root.geometric_error > 0.0,
-            "root should have positive geometric error"
-        );
-        // Multi-level: root should have children (intermediate or leaf)
-        assert!(
-            !output.root.children.is_empty(),
-            "multi-level tileset root should have children"
-        );
-    }
 
-    #[test]
-    fn build_tileset_four_lods() {
-        let lod0 = make_grid_mesh(16); // 512 tris
-        let lod1 = make_grid_mesh(8);  // 128 tris
-        let lod2 = make_grid_mesh(4);  // 32 tris
-        let lod3 = make_grid_mesh(2);  // 8 tris
-
-        let chain = LodChain {
-            levels: vec![
-                LodLevel { level: 0, mesh: lod0, geometric_error: 0.0 },
-                LodLevel { level: 1, mesh: lod1, geometric_error: 0.2 },
-                LodLevel { level: 2, mesh: lod2, geometric_error: 0.5 },
-                LodLevel { level: 3, mesh: lod3, geometric_error: 1.0 },
-            ],
-            bounds: unit_bounds(),
-        };
-
-        let config = TilingConfig {
-            max_triangles_per_tile: 100_000,
-            max_depth: 4,
-        };
-        let materials = MaterialLibrary::default();
-
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
-
-        // Root should be coarsest (LOD 3)
         assert_eq!(output.root.address, "root");
         assert!(output.root.content.is_some());
 
-        // Verify hierarchy depth >= 2 (root + at least intermediate + leaves)
+        // Verify hierarchy depth >= 2 (root + at least one level of children)
         fn max_depth(node: &TileNode) -> usize {
             if node.children.is_empty() {
                 1
@@ -712,32 +587,42 @@ mod tests {
             }
         }
         let depth = max_depth(&output.root);
-        assert!(depth >= 3, "4-LOD hierarchy should have depth >= 3, got {depth}");
+        assert!(
+            depth >= 2,
+            "subdivided hierarchy should have depth >= 2, got {depth}"
+        );
     }
 
     #[test]
     fn geometric_error_decreasing() {
-        let lod0 = make_grid_mesh(10);
-        let lod1 = make_grid_mesh(4);
-        let lod2 = make_grid_mesh(2);
+        let lod0 = make_grid_mesh(16); // 512 tris
 
         let chain = LodChain {
             levels: vec![
-                LodLevel { level: 0, mesh: lod0, geometric_error: 0.0 },
-                LodLevel { level: 1, mesh: lod1, geometric_error: 0.5 },
-                LodLevel { level: 2, mesh: lod2, geometric_error: 1.0 },
+                LodLevel {
+                    level: 0,
+                    mesh: lod0,
+                    geometric_error: 0.0,
+                },
             ],
             bounds: unit_bounds(),
         };
 
         let config = TilingConfig {
-            max_triangles_per_tile: 100_000,
+            max_triangles_per_tile: 50,
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
+        let tmp = tempfile::tempdir().unwrap();
 
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
 
         // Root has highest error
         let root_error = output.root.geometric_error;
@@ -799,18 +684,24 @@ mod tests {
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
-
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
-
         let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
         let transform = identity();
         let tile_count = write_tileset(&output, &transform, tmp.path()).unwrap();
 
         // Should have tileset.json
         assert!(tmp.path().join("tileset.json").exists());
 
-        // Should have tiles directory
+        // Should have tiles directory (GLBs written eagerly)
         assert!(tmp.path().join("tiles").exists());
 
         // Should have at least 1 tile
@@ -834,11 +725,17 @@ mod tests {
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
-
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
-
         let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
         let transform = identity();
         write_tileset(&output, &transform, tmp.path()).unwrap();
 
@@ -870,10 +767,7 @@ mod tests {
             max_triangles_per_tile: 100_000,
             max_depth: 4,
         };
-        let materials = MaterialLibrary::default();
-
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
+        let _materials = MaterialLibrary::default();
 
         let transform = [
             1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 100.0, 200.0, 300.0,
@@ -881,6 +775,14 @@ mod tests {
         ];
 
         let tmp = tempfile::tempdir().unwrap();
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &MaterialLibrary::default(),
+            &tex_config_disabled(),
+            tmp.path(),
+        );
         write_tileset(&output, &transform, tmp.path()).unwrap();
 
         let json_str = fs::read_to_string(tmp.path().join("tileset.json")).unwrap();
@@ -929,7 +831,7 @@ mod tests {
             ..Default::default()
         };
 
-        let merged = merge_meshes(&a, &b);
+        let merged = merge_meshes(a, &b);
         assert_eq!(merged.vertex_count(), 6);
         assert_eq!(merged.triangle_count(), 2);
         // Second triangle's indices should be offset by 3
@@ -947,36 +849,44 @@ mod tests {
             ..Default::default()
         };
 
-        let result = merge_meshes(&empty, &mesh);
+        let result = merge_meshes(empty, &mesh);
         assert_eq!(result.positions.len(), mesh.positions.len());
 
-        let result2 = merge_meshes(&mesh, &empty);
+        let result2 = merge_meshes(mesh.clone(), &IndexedMesh::default());
         assert_eq!(result2.positions.len(), mesh.positions.len());
     }
 
     #[test]
     fn hierarchical_dirs_created() {
         let lod0 = make_grid_mesh(10);
-        let lod1 = make_grid_mesh(4);
 
         let chain = LodChain {
             levels: vec![
-                LodLevel { level: 0, mesh: lod0, geometric_error: 0.0 },
-                LodLevel { level: 1, mesh: lod1, geometric_error: 0.5 },
+                LodLevel {
+                    level: 0,
+                    mesh: lod0,
+                    geometric_error: 0.0,
+                },
             ],
             bounds: unit_bounds(),
         };
 
         let config = TilingConfig {
-            max_triangles_per_tile: 100_000,
+            max_triangles_per_tile: 50,
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
-
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
-
         let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
         write_tileset(&output, &identity(), tmp.path()).unwrap();
 
         // tiles/ directory should exist
@@ -988,26 +898,34 @@ mod tests {
     #[test]
     fn all_uris_match_files() {
         let lod0 = make_grid_mesh(10);
-        let lod1 = make_grid_mesh(4);
 
         let chain = LodChain {
             levels: vec![
-                LodLevel { level: 0, mesh: lod0, geometric_error: 0.0 },
-                LodLevel { level: 1, mesh: lod1, geometric_error: 0.5 },
+                LodLevel {
+                    level: 0,
+                    mesh: lod0,
+                    geometric_error: 0.0,
+                },
             ],
             bounds: unit_bounds(),
         };
 
         let config = TilingConfig {
-            max_triangles_per_tile: 100_000,
+            max_triangles_per_tile: 50,
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
-
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
-
         let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
         write_tileset(&output, &identity(), tmp.path()).unwrap();
 
         // Collect all URIs from the tileset
@@ -1023,7 +941,7 @@ mod tests {
         let mut uris = Vec::new();
         collect_uris(&output.root, &mut uris);
 
-        // Every URI should map to an actual file
+        // Every URI should map to an actual file (written eagerly)
         for uri in &uris {
             let path = tmp.path().join(uri);
             assert!(
@@ -1037,7 +955,6 @@ mod tests {
     #[test]
     fn glb_files_exist_on_disk() {
         let mesh = make_grid_mesh(10); // 200 triangles
-        let simplified = make_grid_mesh(4);
 
         let chain = LodChain {
             levels: vec![
@@ -1046,25 +963,26 @@ mod tests {
                     mesh: mesh.clone(),
                     geometric_error: 0.0,
                 },
-                LodLevel {
-                    level: 1,
-                    mesh: simplified.clone(),
-                    geometric_error: 0.5,
-                },
             ],
             bounds: unit_bounds(),
         };
 
         let config = TilingConfig {
-            max_triangles_per_tile: 100_000,
+            max_triangles_per_tile: 50,
             max_depth: 4,
         };
         let materials = MaterialLibrary::default();
-
-        let tex_config = TextureConfig { enabled: false, ..Default::default() };
-        let output = build_tileset(&[chain], &unit_bounds(), &config, &materials, &tex_config);
-
         let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
         let tile_count = write_tileset(&output, &identity(), tmp.path()).unwrap();
 
         assert!(tile_count >= 1, "should have written at least 1 tile");
@@ -1086,6 +1004,153 @@ mod tests {
         }
 
         let glb_count = count_glb_files(&tmp.path().join("tiles"));
-        assert_eq!(glb_count, tile_count, "GLB file count should match tile_count");
+        assert_eq!(
+            glb_count, tile_count,
+            "GLB file count should match tile_count"
+        );
+    }
+
+    #[test]
+    fn every_internal_node_has_content() {
+        let mesh = make_grid_mesh(16); // 512 tris
+
+        let chain = LodChain {
+            levels: vec![LodLevel {
+                level: 0,
+                mesh,
+                geometric_error: 0.0,
+            }],
+            bounds: unit_bounds(),
+        };
+
+        let config = TilingConfig {
+            max_triangles_per_tile: 50,
+            max_depth: 4,
+        };
+        let materials = MaterialLibrary::default();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
+        fn check_content(node: &TileNode) {
+            if !node.children.is_empty() {
+                assert!(
+                    node.content.is_some(),
+                    "internal node '{}' at level {} must have content",
+                    node.address,
+                    node.level
+                );
+            }
+            for child in &node.children {
+                check_content(child);
+            }
+        }
+        check_content(&output.root);
+    }
+
+    #[test]
+    fn spatial_subdivision_at_every_level() {
+        let mesh = make_grid_mesh(16); // 512 tris
+
+        let chain = LodChain {
+            levels: vec![LodLevel {
+                level: 0,
+                mesh,
+                geometric_error: 0.0,
+            }],
+            bounds: unit_bounds(),
+        };
+
+        let config = TilingConfig {
+            max_triangles_per_tile: 50,
+            max_depth: 4,
+        };
+        let materials = MaterialLibrary::default();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
+        fn check_branching(node: &TileNode) {
+            if !node.children.is_empty() {
+                assert!(
+                    node.children.len() >= 2,
+                    "internal node '{}' should have branching factor >= 2, got {}",
+                    node.address,
+                    node.children.len()
+                );
+            }
+            for child in &node.children {
+                check_branching(child);
+            }
+        }
+        check_branching(&output.root);
+    }
+
+    #[test]
+    fn child_bounds_contained_in_parent() {
+        let mesh = make_grid_mesh(16); // 512 tris
+
+        let chain = LodChain {
+            levels: vec![LodLevel {
+                level: 0,
+                mesh,
+                geometric_error: 0.0,
+            }],
+            bounds: unit_bounds(),
+        };
+
+        let config = TilingConfig {
+            max_triangles_per_tile: 50,
+            max_depth: 4,
+        };
+        let materials = MaterialLibrary::default();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let output = build_tileset(
+            vec![chain],
+            &unit_bounds(),
+            &config,
+            &materials,
+            &tex_config_disabled(),
+            tmp.path(),
+        );
+
+        fn check_containment(node: &TileNode) {
+            for child in &node.children {
+                // Child bounds should be contained within parent bounds (with epsilon)
+                let eps = 1e-6;
+                assert!(
+                    child.bounds.min[0] >= node.bounds.min[0] - eps
+                        && child.bounds.min[1] >= node.bounds.min[1] - eps
+                        && child.bounds.min[2] >= node.bounds.min[2] - eps
+                        && child.bounds.max[0] <= node.bounds.max[0] + eps
+                        && child.bounds.max[1] <= node.bounds.max[1] + eps
+                        && child.bounds.max[2] <= node.bounds.max[2] + eps,
+                    "child '{}' bounds {:?}-{:?} should be within parent '{}' bounds {:?}-{:?}",
+                    child.address,
+                    child.bounds.min,
+                    child.bounds.max,
+                    node.address,
+                    node.bounds.min,
+                    node.bounds.max
+                );
+                check_containment(child);
+            }
+        }
+        check_containment(&output.root);
     }
 }

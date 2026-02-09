@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use crate::types::{BoundingBox, IndexedMesh};
 
 /// A node in the octree spatial hierarchy.
@@ -82,10 +84,11 @@ pub fn split_mesh(mesh: &IndexedMesh, bounds: &BoundingBox) -> [IndexedMesh; 8] 
 
 /// Recursively build an octree from a mesh.
 ///
+/// Takes ownership of the mesh to avoid unnecessary clones of large buffers.
 /// Subdivides if `triangle_count > max_triangles` AND `depth < max_depth`.
 /// Otherwise the node becomes a leaf containing its mesh.
 pub fn build_octree(
-    mesh: &IndexedMesh,
+    mesh: IndexedMesh,
     bounds: &BoundingBox,
     max_depth: u32,
     max_triangles: usize,
@@ -94,7 +97,7 @@ pub fn build_octree(
 }
 
 fn build_octree_recursive(
-    mesh: &IndexedMesh,
+    mesh: IndexedMesh,
     bounds: &BoundingBox,
     depth: u32,
     max_depth: u32,
@@ -104,27 +107,40 @@ fn build_octree_recursive(
     if mesh.triangle_count() <= max_triangles || depth >= max_depth {
         return OctreeNode {
             bounds: *bounds,
-            mesh: mesh.clone(),
+            mesh, // move, no clone
             children: Default::default(),
         };
     }
 
-    let sub_meshes = split_mesh(mesh, bounds);
+    let sub_meshes = split_mesh(&mesh, bounds);
+    drop(mesh); // free parent mesh before recursing into children
 
-    let children: [Option<Box<OctreeNode>>; 8] = std::array::from_fn(|i| {
-        if sub_meshes[i].is_empty() {
-            None
-        } else {
-            let cb = child_bounds(bounds, i);
-            Some(Box::new(build_octree_recursive(
-                &sub_meshes[i],
-                &cb,
-                depth + 1,
-                max_depth,
-                max_triangles,
-            )))
-        }
-    });
+    // Convert [IndexedMesh; 8] to Vec of (index, mesh) pairs for parallel processing
+    let bounds_copy = *bounds;
+    let child_vec: Vec<Option<Box<OctreeNode>>> = sub_meshes
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(i, sub)| {
+            if sub.is_empty() {
+                None
+            } else {
+                let cb = child_bounds(&bounds_copy, i);
+                Some(Box::new(build_octree_recursive(
+                    sub,
+                    &cb,
+                    depth + 1,
+                    max_depth,
+                    max_triangles,
+                )))
+            }
+        })
+        .collect();
+
+    let children: [Option<Box<OctreeNode>>; 8] = child_vec
+        .try_into()
+        .expect("parallel octree should produce exactly 8 children");
 
     OctreeNode {
         bounds: *bounds,
@@ -372,7 +388,7 @@ mod tests {
     #[test]
     fn build_octree_leaf_when_few_triangles() {
         let (mesh, bounds) = make_flat_grid(4); // 32 triangles
-        let tree = build_octree(&mesh, &bounds, 6, 100);
+        let tree = build_octree(mesh, &bounds, 6, 100);
 
         // 32 < 100 → should be a leaf
         assert!(tree.is_leaf());
@@ -382,10 +398,11 @@ mod tests {
     #[test]
     fn build_octree_leaf_at_max_depth() {
         let (mesh, bounds) = make_3d_grid(4);
-        let tree = build_octree(&mesh, &bounds, 0, 1); // max_depth=0 → immediate leaf
+        let tris = mesh.triangle_count();
+        let tree = build_octree(mesh, &bounds, 0, 1); // max_depth=0 → immediate leaf
 
         assert!(tree.is_leaf());
-        assert_eq!(tree.mesh.triangle_count(), mesh.triangle_count());
+        assert_eq!(tree.mesh.triangle_count(), tris);
     }
 
     #[test]
@@ -394,7 +411,7 @@ mod tests {
         let original_tris = mesh.triangle_count();
 
         // Set max_triangles low enough to force splitting
-        let tree = build_octree(&mesh, &bounds, 4, 50);
+        let tree = build_octree(mesh, &bounds, 4, 50);
 
         assert!(!tree.is_leaf(), "large mesh should be subdivided");
         assert!(tree.node_count() > 1);

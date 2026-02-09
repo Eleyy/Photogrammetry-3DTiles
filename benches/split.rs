@@ -122,7 +122,7 @@ fn bench_octree(c: &mut Criterion) {
     };
 
     c.bench_function("build_octree_depth4_88k", |b| {
-        b.iter(|| build_octree(&mesh, &bounds, 4, 10_000));
+        b.iter(|| build_octree(mesh.clone(), &bounds, 4, 10_000));
     });
 }
 

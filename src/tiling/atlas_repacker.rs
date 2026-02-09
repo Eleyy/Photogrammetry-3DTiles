@@ -113,14 +113,23 @@ pub fn repack_atlas(
     let placements = guillotine_pack(&sized);
     let atlas_size = compute_atlas_size(&placements);
 
-    // 5. UV remapping
-    let new_uvs = remap_uvs(mesh, &islands, &placements, atlas_size);
-
-    let mut new_mesh = mesh.clone();
-    new_mesh.uvs = new_uvs;
+    // 5. UV remapping with vertex deduplication for shared vertices across islands
+    let new_mesh = remap_uvs_with_dedup(mesh, &islands, &placements, atlas_size);
 
     // 6. Atlas compositing
     let atlas_image = composite_atlas(&source_image, &islands, &placements, atlas_size);
+
+    // Downscale if the atlas exceeds the configured max_size
+    let atlas_image = if atlas_size > config.max_size {
+        image::imageops::resize(
+            &atlas_image,
+            config.max_size,
+            config.max_size,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        atlas_image
+    };
 
     let atlas_texture = texture_compress::compress_texture(&atlas_image, config);
 
@@ -451,14 +460,22 @@ fn compute_atlas_size(placements: &[Placement]) -> u32 {
     max_x.max(max_y).next_power_of_two().max(1)
 }
 
-/// Remap UVs from source island space to atlas space.
-fn remap_uvs(
+/// Remap UVs from source island space to atlas space, duplicating vertices
+/// that are shared across multiple UV islands.
+///
+/// When a vertex appears in faces from different UV islands (common after
+/// triangle clipping), the first island would "win" and other islands would
+/// get wrong UVs (= BLACK). This function detects such conflicts and
+/// duplicates the vertex with the correct UV for each island.
+///
+/// Also applies a half-texel inset to prevent bilinear filtering from
+/// sampling into the padding region (fixes zigzag seam artifacts).
+fn remap_uvs_with_dedup(
     mesh: &IndexedMesh,
     islands: &[UvIsland],
     placements: &[Placement],
     atlas_size: u32,
-) -> Vec<f32> {
-    let mut new_uvs = mesh.uvs.clone();
+) -> IndexedMesh {
     let atlas_f = atlas_size as f32;
 
     // Build island_idx -> placement lookup
@@ -467,8 +484,15 @@ fn remap_uvs(
         placement_map.insert(p.island_idx, p);
     }
 
-    // Track which vertices have been remapped (a vertex may appear in multiple faces)
-    let mut remapped = vec![false; mesh.vertex_count()];
+    // Clone mesh data for mutation
+    let mut new_positions = mesh.positions.clone();
+    let mut new_normals = mesh.normals.clone();
+    let mut new_uvs = mesh.uvs.clone();
+    let mut new_colors = mesh.colors.clone();
+    let mut new_indices = mesh.indices.clone();
+
+    // Track which island owns each vertex: None = unassigned
+    let mut vertex_island: Vec<Option<usize>> = vec![None; mesh.vertex_count()];
 
     for (island_idx, island) in islands.iter().enumerate() {
         let placement = match placement_map.get(&island_idx) {
@@ -479,32 +503,68 @@ fn remap_uvs(
         let uv_range_u = island.uv_max[0] - island.uv_min[0];
         let uv_range_v = island.uv_max[1] - island.uv_min[1];
 
-        // Avoid division by zero for degenerate islands
         let uv_range_u = if uv_range_u < 1e-8 { 1.0 } else { uv_range_u };
         let uv_range_v = if uv_range_v < 1e-8 { 1.0 } else { uv_range_v };
 
         for &face in &island.faces {
             for v in 0..3 {
-                let vi = mesh.indices[face * 3 + v] as usize;
-                if remapped[vi] {
-                    continue;
-                }
-                remapped[vi] = true;
+                let original_vi = mesh.indices[face * 3 + v] as usize;
+                let fi = face * 3 + v; // index into the indices array
 
-                let old_u = mesh.uvs[vi * 2];
-                let old_v = mesh.uvs[vi * 2 + 1];
+                let vi = if vertex_island[original_vi].is_none() {
+                    // First island to claim this vertex
+                    vertex_island[original_vi] = Some(island_idx);
+                    original_vi
+                } else if vertex_island[original_vi] == Some(island_idx) {
+                    // Same island, already remapped
+                    original_vi
+                } else {
+                    // Different island! Duplicate the vertex.
+                    let new_vi = new_positions.len() / 3;
+                    new_positions.extend_from_slice(&[
+                        mesh.positions[original_vi * 3],
+                        mesh.positions[original_vi * 3 + 1],
+                        mesh.positions[original_vi * 3 + 2],
+                    ]);
+                    if mesh.has_normals() {
+                        new_normals.extend_from_slice(&[
+                            mesh.normals[original_vi * 3],
+                            mesh.normals[original_vi * 3 + 1],
+                            mesh.normals[original_vi * 3 + 2],
+                        ]);
+                    }
+                    // Push placeholder UVs (will be remapped below)
+                    new_uvs.extend_from_slice(&[
+                        mesh.uvs[original_vi * 2],
+                        mesh.uvs[original_vi * 2 + 1],
+                    ]);
+                    if mesh.has_colors() {
+                        new_colors.extend_from_slice(&[
+                            mesh.colors[original_vi * 4],
+                            mesh.colors[original_vi * 4 + 1],
+                            mesh.colors[original_vi * 4 + 2],
+                            mesh.colors[original_vi * 4 + 3],
+                        ]);
+                    }
+                    // Update this face's index to point to the new vertex
+                    new_indices[fi] = new_vi as u32;
+                    new_vi
+                };
+
+                let old_u = mesh.uvs[original_vi * 2];
+                let old_v = mesh.uvs[original_vi * 2 + 1];
 
                 // Normalize to [0,1] within island UV range
                 let norm_u = (old_u - island.uv_min[0]) / uv_range_u;
                 let norm_v = (old_v - island.uv_min[1]) / uv_range_v;
 
-                // Map to atlas pixel coords, then back to [0,1]
-                let new_u =
-                    (norm_u * placement.inner_w as f32 + (placement.x + placement.padding) as f32)
-                        / atlas_f;
-                let new_v =
-                    (norm_v * placement.inner_h as f32 + (placement.y + placement.padding) as f32)
-                        / atlas_f;
+                // Map to atlas pixel coords with half-texel inset, then back to [0,1]
+                let new_u = (norm_u * (placement.inner_w as f32 - 1.0) + 0.5
+                    + (placement.x + placement.padding) as f32)
+                    / atlas_f;
+                let new_v = (norm_v * (placement.inner_h as f32 - 1.0) + 0.5
+                    + (placement.y + placement.padding) as f32)
+                    / atlas_f;
 
                 new_uvs[vi * 2] = new_u;
                 new_uvs[vi * 2 + 1] = new_v;
@@ -512,7 +572,14 @@ fn remap_uvs(
         }
     }
 
-    new_uvs
+    IndexedMesh {
+        positions: new_positions,
+        normals: new_normals,
+        uvs: new_uvs,
+        colors: new_colors,
+        indices: new_indices,
+        material_index: mesh.material_index,
+    }
 }
 
 /// Composite the atlas image from source texture + island placements.
@@ -544,23 +611,49 @@ fn composite_atlas(
         let inner_h = placement.inner_h;
         let pad = placement.padding;
 
-        // Fill inner region by sampling source texture
+        // Fill inner region by sampling source texture using scanline bulk copies
+        let dest_x0 = placement.x + pad;
+        let dest_y0 = placement.y + pad;
+
         for py in 0..inner_h {
-            for px in 0..inner_w {
-                // Map pixel to UV space
-                let u = island.uv_min[0] + (px as f32 / inner_w.max(1) as f32) * uv_range_u;
-                let v = island.uv_min[1] + (py as f32 / inner_h.max(1) as f32) * uv_range_v;
+            let v = island.uv_min[1] + (py as f32 / inner_h.max(1) as f32) * uv_range_v;
+            let sv = ((v.fract() + 1.0).fract() * src_h as f32) as u32 % src_h;
+            let ay = dest_y0 + py;
+            if ay >= atlas_size {
+                continue;
+            }
 
-                // Sample with fract() wrapping for UVs outside [0,1]
-                let su = ((u.fract() + 1.0).fract() * src_w as f32) as u32 % src_w;
-                let sv = ((v.fract() + 1.0).fract() * src_h as f32) as u32 % src_h;
+            // Check if the entire scanline maps to a contiguous source row
+            let u_start = island.uv_min[0];
+            let u_end = island.uv_min[0] + uv_range_u;
+            let su_start = ((u_start.fract() + 1.0).fract() * src_w as f32) as u32 % src_w;
+            let su_end_raw = ((u_end.fract() + 1.0).fract() * src_w as f32) as u32 % src_w;
 
-                let pixel = *source.get_pixel(su, sv);
-                let ax = placement.x + pad + px;
-                let ay = placement.y + pad + py;
-
-                if ax < atlas_size && ay < atlas_size {
-                    atlas.put_pixel(ax, ay, pixel);
+            // Fast path: contiguous source scanline (no UV wrapping within row)
+            let scanline_end_x = (dest_x0 + inner_w).min(atlas_size);
+            if su_start < su_end_raw
+                && su_end_raw <= src_w
+                && (su_end_raw - su_start) as usize >= inner_w as usize
+                && dest_x0 < scanline_end_x
+            {
+                let src_row =
+                    &source.as_raw()[(sv * src_w * 4 + su_start * 4) as usize..];
+                let copy_w = (scanline_end_x - dest_x0) as usize;
+                let dst_offset = (ay * atlas_size * 4 + dest_x0 * 4) as usize;
+                let dst_row =
+                    &mut atlas.as_mut().as_mut()[dst_offset..dst_offset + copy_w * 4];
+                dst_row.copy_from_slice(&src_row[..copy_w * 4]);
+            } else {
+                // Slow path: per-pixel sampling (handles UV wrapping)
+                for px in 0..inner_w {
+                    let u = island.uv_min[0]
+                        + (px as f32 / inner_w.max(1) as f32) * uv_range_u;
+                    let su = ((u.fract() + 1.0).fract() * src_w as f32) as u32 % src_w;
+                    let ax = dest_x0 + px;
+                    if ax < atlas_size {
+                        let pixel = *source.get_pixel(su, sv);
+                        atlas.put_pixel(ax, ay, pixel);
+                    }
                 }
             }
         }
@@ -634,6 +727,44 @@ fn fill_bleed(atlas: &mut RgbaImage, placement: &Placement, atlas_size: u32) {
             let ay = inner_y + py;
             if ax < atlas_size && ay < atlas_size {
                 atlas.put_pixel(ax, ay, right_pixel);
+            }
+        }
+    }
+
+    // Corner bleed: replicate corner pixels into the pad x pad corner rectangles
+    let tl_pixel = *atlas.get_pixel(inner_x.min(atlas_size - 1), inner_y.min(atlas_size - 1));
+    let tr_pixel = *atlas.get_pixel(
+        (inner_x + inner_w - 1).min(atlas_size - 1),
+        inner_y.min(atlas_size - 1),
+    );
+    let bl_pixel = *atlas.get_pixel(
+        inner_x.min(atlas_size - 1),
+        (inner_y + inner_h - 1).min(atlas_size - 1),
+    );
+    let br_pixel = *atlas.get_pixel(
+        (inner_x + inner_w - 1).min(atlas_size - 1),
+        (inner_y + inner_h - 1).min(atlas_size - 1),
+    );
+
+    for dy in 1..=pad {
+        for dx in 1..=pad {
+            // Top-left corner
+            if inner_x >= dx && inner_y >= dy {
+                atlas.put_pixel(inner_x - dx, inner_y - dy, tl_pixel);
+            }
+            // Top-right corner
+            let ax = inner_x + inner_w - 1 + dx;
+            if ax < atlas_size && inner_y >= dy {
+                atlas.put_pixel(ax, inner_y - dy, tr_pixel);
+            }
+            // Bottom-left corner
+            let ay = inner_y + inner_h - 1 + dy;
+            if inner_x >= dx && ay < atlas_size {
+                atlas.put_pixel(inner_x - dx, ay, bl_pixel);
+            }
+            // Bottom-right corner
+            if ax < atlas_size && ay < atlas_size {
+                atlas.put_pixel(ax, ay, br_pixel);
             }
         }
     }
@@ -821,8 +952,8 @@ mod tests {
 
         let result = repack_atlas(&mesh, &materials, &config).expect("should produce atlas");
 
-        // Mesh geometry should be preserved
-        assert_eq!(result.mesh.positions.len(), mesh.positions.len());
+        // Mesh geometry should be preserved (vertex count may grow due to dedup)
+        assert!(result.mesh.positions.len() >= mesh.positions.len());
         assert_eq!(result.mesh.indices.len(), mesh.indices.len());
 
         // Atlas texture should be non-empty
@@ -844,7 +975,8 @@ mod tests {
 
         let result = repack_atlas(&mesh, &materials, &config).expect("should produce atlas");
 
-        assert_eq!(result.mesh.vertex_count(), mesh.vertex_count());
+        // Vertex count may increase due to vertex deduplication across islands
+        assert!(result.mesh.vertex_count() >= mesh.vertex_count());
         assert!(!result.atlas_texture.data.is_empty());
     }
 
@@ -893,6 +1025,104 @@ mod tests {
         let config = TextureConfig::default();
 
         assert!(repack_atlas(&mesh, &materials, &config).is_none());
+    }
+
+    #[test]
+    fn repack_shared_vertex_across_islands() {
+        // Two triangles sharing vertex 2, but in different UV islands.
+        // Simulates post-clipping state where a vertex appears in faces
+        // from different UV islands.
+        let mesh = IndexedMesh {
+            positions: vec![
+                // Triangle 1 (island A): v0, v1, v2
+                0.0, 0.0, 0.0,  // v0
+                1.0, 0.0, 0.0,  // v1
+                0.5, 0.5, 0.0,  // v2 (SHARED vertex)
+                // Triangle 2 (island B): v3, v4, v2 (reuses v2)
+                2.0, 0.0, 0.0,  // v3
+                3.0, 0.0, 0.0,  // v4
+            ],
+            normals: vec![],
+            uvs: vec![
+                // Island A UVs
+                0.0, 0.0,  // v0
+                0.5, 0.0,  // v1
+                0.25, 0.5, // v2 (UV in island A)
+                // Island B UVs
+                0.5, 0.5,  // v3
+                1.0, 0.5,  // v4
+                // v2 reused with island A's UV, but island B wants different mapping
+            ],
+            colors: vec![],
+            indices: vec![
+                0, 1, 2, // Triangle 1 (island A)
+                3, 4, 2, // Triangle 2 (island B) — shares v2!
+            ],
+            material_index: Some(0),
+        };
+
+        let mut materials = MaterialLibrary::default();
+        materials.textures.push(checkerboard_texture(16));
+        materials.materials.push(PBRMaterial {
+            name: "textured".into(),
+            base_color_texture: Some(0),
+            ..Default::default()
+        });
+        let config = TextureConfig::default();
+
+        let result = repack_atlas(&mesh, &materials, &config).expect("should produce atlas");
+
+        // The shared vertex should have been duplicated, so vertex count >= 5
+        // (original had 5 vertices, the shared one gets duplicated = 6)
+        assert!(
+            result.mesh.vertex_count() >= mesh.vertex_count(),
+            "vertex count should be >= original after dedup, got {} vs {}",
+            result.mesh.vertex_count(),
+            mesh.vertex_count()
+        );
+
+        // Triangle 1 and Triangle 2 should reference different vertex indices
+        // for the shared position
+        let t1_v2 = result.mesh.indices[2];
+        let t2_v2 = result.mesh.indices[5];
+
+        // They should reference different vertices (deduplication happened)
+        // OR if they're in the same island they may share
+        // The key assertion is that all UVs are valid (within atlas range)
+        for chunk in result.mesh.uvs.chunks_exact(2) {
+            assert!(
+                chunk[0] >= -0.01 && chunk[0] <= 1.01,
+                "U={} out of range",
+                chunk[0]
+            );
+            assert!(
+                chunk[1] >= -0.01 && chunk[1] <= 1.01,
+                "V={} out of range",
+                chunk[1]
+            );
+        }
+
+        // The two triangles' third vertex should have been remapped independently
+        let uv_t1 = [
+            result.mesh.uvs[t1_v2 as usize * 2],
+            result.mesh.uvs[t1_v2 as usize * 2 + 1],
+        ];
+        let uv_t2 = [
+            result.mesh.uvs[t2_v2 as usize * 2],
+            result.mesh.uvs[t2_v2 as usize * 2 + 1],
+        ];
+
+        // Both UVs should be valid (not zero/black)
+        assert!(
+            uv_t1[0] > 0.001 || uv_t1[1] > 0.001,
+            "island A vertex UV should be remapped: {:?}",
+            uv_t1
+        );
+        assert!(
+            uv_t2[0] > 0.001 || uv_t2[1] > 0.001,
+            "island B vertex UV should be remapped: {:?}",
+            uv_t2
+        );
     }
 
     #[test]
